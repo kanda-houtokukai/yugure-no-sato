@@ -54,7 +54,11 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let sun = frame.sunDir.xyz;
   // 画素の足元。水面をかすめる視線では奥行き方向に伸びる
   let footprint = dist * frame.camUp.w * 2.0 / frame.center.w / max(abs(v.y), 0.05);
-  let n = select(rippleNormal(in.world.xz, footprint), vec3f(0.0, 1.0, 0.0), frame.params.w == 16.0);   // 計測用 dbg=16: さざ波なし
+  var n = select(rippleNormal(in.world.xz, footprint), vec3f(0.0, 1.0, 0.0), frame.params.w == 16.0);   // 計測用 dbg=16: さざ波なし
+  // 変形の場: 足が起こした波紋（法線の傾き）と濁り、沈んだ泥
+  let df = deformAt(in.world.xz);
+  let rg = rippleGradient(in.world.xz);
+  n = normalize(vec3f(n.x - rg.x, n.y, n.z - rg.y));
 
   // ---- 映り込み ----
   let r = reflect(-v, n);
@@ -81,8 +85,11 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let mud = vec3f(0.12, 0.10, 0.07) * (sunLight + ambient);
   // 濁り: 水中で散った光の色。深さ 0.12m の田なので泥の色が半分ほど残る
   let murk = vec3f(0.20, 0.18, 0.11) * ambient * 0.6;
-  let depthFactor = exp(-vec3f(2.4, 2.0, 3.4) * 0.12 * 2.0 / max(cosTheta, 0.1));
-  let under = mix(murk, mud * depthFactor, 0.55);
+  let depthFactor = exp(-vec3f(2.4, 2.0, 3.4) * (0.12 + df.sink) * 2.0 / max(cosTheta, 0.1));
+  var under = mix(murk, mud * depthFactor, 0.55);
+  // 濁り: 舞い上がった泥の色が水中で散る
+  let stirred = vec3f(0.30, 0.24, 0.13) * ambient * 0.9;
+  under = mix(under, stirred, df.turbidity * 0.75);
 
   var color = mix(under, refl, fresnel);
 

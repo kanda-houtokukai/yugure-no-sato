@@ -28,7 +28,8 @@ fn vs(@builtin(vertex_index) vid: u32) -> VSOut {
     p = center + r * vec2f(cos(a), sin(a));
   }
   let footprint = max(0.05, r * TAU / f32(sectors));
-  let h = terrainHeight(p, footprint * 2.0);
+  // 数式の高さ（正本）に、変形の場の沈みを足す。正本そのものは変えない
+  let h = terrainHeight(p, footprint * 2.0) - deformAt(p).sink;
   let world = vec3f(p.x, h, p.y);
 
   var out: VSOut;
@@ -59,8 +60,14 @@ fn fs(in: VSOut) -> FSOut {
 
   // 材質・法線・日向/日陰はすべて焼いたもの（画素ごとに数式を評価しない）
   let baked = bakedLight(p);
-  let n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);   // 計測用 dbg=7: 双三次で直接計算
-  let albedo = baked.albedo;
+  var n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);   // 計測用 dbg=7: 双三次で直接計算
+  // 変形の沈みで法線も傾ける（高さだけ変えると、へこんでいるのに陰影が平らなまま）
+  let sg = deformSinkGradient(p);
+  n = normalize(vec3f(n.x + sg.x * n.y, n.y, n.z + sg.y * n.y));
+  let df = deformAt(p);
+  var albedo = baked.albedo;
+  // 踏み固めた土は湿って暗く見える（道の沈みは 2cm 程度で陰影だけでは見えにくい）
+  if (baked.kind == 3u || baked.kind == 0u || baked.kind == 2u) { albedo *= 1.0 - 0.45 * clamp(df.sink / 0.02, 0.0, 1.0); }
   let sun = frame.sunDir.xyz;
   let ndl = max(dot(n, sun), 0.0);
 

@@ -13,6 +13,7 @@ struct Frame {
   ring: vec4f,         // x = r0, y = 隣接リング比 k, z = リング数, w = 扇形数
   center: vec4f,       // xy = リング中心の世界 xz, zw = 描画解像度 [px]
   wind: vec4f,         // xy = 風テクスチャの原点（世界 xz）, z = テクセル [m], w = 1辺のテクセル数
+  deform: vec4f,       // xy = 変形の窓の原点（世界 xz）, z = テクセル [m], w = 1辺のテクセル数
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;

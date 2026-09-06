@@ -4,6 +4,7 @@
 struct GrassInstance {
   pos: vec4f,     // xyz = 根元, w = 乱数の種
   attr: vec4f,    // x = 大きさ, y = 回転, z = 日向/日陰, w = 種類（0 = 青草, 1 = 枯れ茎）
+  deform: vec4f,  // xy = 倒れ方向, z = 倒れ量, w = 予備
 };
 const GRASS_NEAR_R: f32 = 30.0;
 const GRASS_MID_R: f32 = 120.0;
@@ -56,10 +57,12 @@ fn grassSpawn(cell: vec2i, step: f32, lod: u32, seed: u32) {
   if (h3 > grassDensity(p, b)) { return; }
   if (b.normal.y < 0.55) { return; }   // 急斜面には生えない
   let y = sampleHeight(heightLevelFor(p), p);
+  let df = deformAt(p);
   var inst: GrassInstance;
-  inst.pos = vec4f(p.x, y, p.y, h0);
+  inst.pos = vec4f(p.x, y - df.sink, p.y, h0);
   let dry = select(0.0, 1.0, hash2f(cell, seed + 4u) < 0.18);
   inst.attr = vec4f(0.45 + 0.9 * h1 * h1, h2 * TAU, b.shadow, dry);
+  inst.deform = vec4f(df.bend, length(df.bend), 0.0);
   let idx = atomicAdd(&grassArgs[lod].instanceCount, 1u);
   if (idx < GRASS_MAX) {
     if (lod == 0u) { grassNear[idx] = inst; } else { grassMid[idx] = inst; }
@@ -100,9 +103,10 @@ const G_SEGS: u32 = 2u;
 const G_VERTS_PER_BLADE: u32 = G_SEGS * 6u;
 const GRASS_NEAR_VERTS: u32 = G_BLADES * G_VERTS_PER_BLADE;   // 60
 
-fn grassBladeCenter(base: vec3f, dirXZ: vec2f, height: f32, s: f32, bend: vec2f) -> vec3f {
+fn grassBladeCenter(base: vec3f, dirXZ: vec2f, height: f32, s: f32, bend: vec2f, flat: vec3f) -> vec3f {
   let lean = 0.45 * s * s;
-  return base + vec3f(dirXZ.x * lean * height + bend.x * height * s * s, height * s * (1.0 - 0.2 * s), dirXZ.y * lean * height + bend.y * height * s * s);
+  let b = bend * (1.0 - 0.85 * flat.z) + flat.xy * 1.1;
+  return base + vec3f(dirXZ.x * lean * height + b.x * height * s * s, height * s * (1.0 - 0.2 * s) * (1.0 - 0.7 * flat.z * s), dirXZ.y * lean * height + b.y * height * s * s);
 }
 
 @vertex
@@ -131,8 +135,9 @@ fn vsGrassNear(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32)
   let flutter = 0.12 * sin(t * (3.0 + 2.5 * bh) + inst.pos.w * 40.0 + f32(blade));
   let bend = wind.bend * (0.35 + 0.5 * bh2) + vec2f(-WIND_DIR.y, WIND_DIR.x) * flutter * wind.strength;
 
-  let c = grassBladeCenter(base, dirXZ, height, up, bend);
-  let cNext = grassBladeCenter(base, dirXZ, height, min(up + 0.25, 1.0), bend);
+  let flat = inst.deform.xyz;
+  let c = grassBladeCenter(base, dirXZ, height, up, bend, flat);
+  let cNext = grassBladeCenter(base, dirXZ, height, min(up + 0.25, 1.0), bend, flat);
   let tangent = normalize(cNext - c + vec3f(0.0, 1e-4, 0.0));
   let side = normalize(cross(vec3f(0.0, 1.0, 0.0), vec3f(dirXZ.x, 0.0, dirXZ.y)));
   let width = mix(0.006, 0.011, bh) * mix(1.0, 0.5, dry) * (1.0 - up * up * 0.9);
@@ -159,8 +164,10 @@ fn vsGrassMid(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let side = vec3f(cos(ang), 0.0, sin(ang));
   let wind = windAt(inst.pos.xz);
   let height = mix(0.2, 0.55, inst.attr.x);
-  let world = inst.pos.xyz + side * (sx * 0.35) + vec3f(0.0, height * up, 0.0)
-    + vec3f(wind.bend.x, 0.0, wind.bend.y) * (0.5 * up * up * height);
+  let flat = inst.deform.xyz;
+  let world = inst.pos.xyz + side * (sx * 0.35) + vec3f(0.0, height * up * (1.0 - 0.7 * flat.z), 0.0)
+    + vec3f(wind.bend.x, 0.0, wind.bend.y) * (0.5 * up * up * height) * (1.0 - 0.85 * flat.z)
+    + vec3f(flat.x, 0.0, flat.y) * (1.1 * up * up * height);
   var out: GVSOut;
   out.pos = frame.viewProj * vec4f(world - frame.camPos.xyz, 1.0);
   out.world = world;

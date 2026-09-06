@@ -8,7 +8,8 @@
 // ==== SECTION: common ====
 struct RiceInstance {
   pos: vec4f,     // xyz = 株元の世界座標, w = 乱数の種
-  attr: vec4f,    // x = 大きさ, y = 回転, z = 予備, w = 予備
+  attr: vec4f,    // x = 大きさ, y = 回転, z = 日向/日陰, w = 予備
+  deform: vec4f,  // xy = 倒れ方向（xz）, z = 倒れ量 0..1, w = 予備（生成時に変形の場から写す）
 };
 const RICE_ROW: f32 = 0.30;      // 条間 [m]
 const RICE_HILL: f32 = 0.22;     // 株間 [m]
@@ -64,10 +65,13 @@ fn spawnCommon(uv: vec2f, lod: u32, seed: u32) {
   let jitter = (vec2f(h, h2) - 0.5) * 0.06;
   let pj = w + jitter;
   let y = sampleHeight(heightLevelFor(pj), pj);
+  // 変形の場: 沈んだ泥に合わせて株元を下げ、倒れ方向を写す（地形・水面と同じ場を見る）
+  let df = deformAt(pj);
   var inst: RiceInstance;
-  inst.pos = vec4f(pj.x, y, pj.y, h);
+  inst.pos = vec4f(pj.x, y - df.sink, pj.y, h);
   // z = 株元の日向/日陰（頂点ごとにテクスチャを引かずに済ませる）
   inst.attr = vec4f(0.8 + 0.4 * h2, h * TAU, bakedLight(pj).shadow, 0.0);
+  inst.deform = vec4f(df.bend, length(df.bend), 0.0);
   let idx = atomicAdd(&riceArgs[lod].instanceCount, 1u);
   if (idx < RICE_MAX) {
     if (lod == 0u) { riceNear[idx] = inst; } else { riceMid[idx] = inst; }
@@ -114,12 +118,14 @@ const SEGS: u32 = 3u;
 const VERTS_PER_BLADE: u32 = SEGS * 6u;
 const NEAR_VERTS: u32 = BLADES * VERTS_PER_BLADE;   // 126
 
-/** 葉 1 枚の、根元からの高さ比 s (0..1) における中心線と幅 */
-fn bladeCenter(base: vec3f, dirXZ: vec2f, height: f32, s: f32, wind: Wind, t: f32) -> vec3f {
+/** 葉 1 枚の、根元からの高さ比 s (0..1) における中心線。flat = 倒れ（xy 方向, z 量）: 倒れた株は風の揺れも鈍る */
+fn bladeCenter(base: vec3f, dirXZ: vec2f, height: f32, s: f32, wind: Wind, t: f32, flat: vec3f) -> vec3f {
   // 外側へ反りながら立ち上がる。風は先端ほど強く風下へ倒す
   let lean = 0.35 * s * s;
-  let windBend = wind.bend * (0.55 + 0.25 * sin(t * 2.3 + base.x * 3.1 + base.z * 2.7)) * s * s;
-  return base + vec3f(dirXZ.x * lean * height + windBend.x * height, height * s * (1.0 - 0.15 * s), dirXZ.y * lean * height + windBend.y * height);
+  let windBend = wind.bend * (0.55 + 0.25 * sin(t * 2.3 + base.x * 3.1 + base.z * 2.7)) * s * s * (1.0 - 0.85 * flat.z);
+  let down = flat.xy * (1.1 * s * s) * height;
+  let rise = height * s * (1.0 - 0.15 * s) * (1.0 - 0.7 * flat.z * s);
+  return base + vec3f(dirXZ.x * lean * height + windBend.x * height + down.x, rise, dirXZ.y * lean * height + windBend.y * height + down.y);
 }
 
 @vertex
@@ -142,8 +148,9 @@ fn vsNear(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> V
 
   let t = frame.params.x;
   let wind = windAt(inst.pos.xz);
-  let c = bladeCenter(base, dirXZ, height, up, wind, t);
-  let cNext = bladeCenter(base, dirXZ, height, min(up + 0.2, 1.0), wind, t);
+  let flat = inst.deform.xyz;
+  let c = bladeCenter(base, dirXZ, height, up, wind, t, flat);
+  let cNext = bladeCenter(base, dirXZ, height, min(up + 0.2, 1.0), wind, t, flat);
   let tangent = normalize(cNext - c + vec3f(0.0, 1e-4, 0.0));
   let side = normalize(cross(vec3f(0.0, 1.0, 0.0), vec3f(dirXZ.x, 0.0, dirXZ.y)));
   let width = 0.009 * inst.attr.x * (1.0 - up * up);   // 先端へ細く
@@ -170,8 +177,10 @@ fn vsMid(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VS
   let side = vec3f(cos(ang), 0.0, sin(ang));
   let wind = windAt(inst.pos.xz);
   let height = 0.5 * inst.attr.x;
-  let world = inst.pos.xyz + side * (sx * 0.5) + vec3f(0.0, height * up, 0.0)
-    + vec3f(wind.bend.x, 0.0, wind.bend.y) * (0.6 * up * up * height);
+  let flat = inst.deform.xyz;
+  let world = inst.pos.xyz + side * (sx * 0.5) + vec3f(0.0, height * up * (1.0 - 0.7 * flat.z), 0.0)
+    + vec3f(wind.bend.x, 0.0, wind.bend.y) * (0.6 * up * up * height) * (1.0 - 0.85 * flat.z)
+    + vec3f(flat.x, 0.0, flat.y) * (1.1 * up * up * height);
   var out: VSOut;
   out.pos = frame.viewProj * vec4f(world - frame.camPos.xyz, 1.0);
   out.world = world;

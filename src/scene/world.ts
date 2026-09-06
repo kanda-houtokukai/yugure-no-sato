@@ -20,6 +20,9 @@ import windWgsl from '../shaders/wind.wgsl?raw';
 import riceWgsl from '../shaders/rice.wgsl?raw';
 import grassWgsl from '../shaders/grass.wgsl?raw';
 import treeWgsl from '../shaders/tree.wgsl?raw';
+import deformWgsl from '../shaders/deform.wgsl?raw';
+import deformUpdateWgsl from '../shaders/deform-update.wgsl?raw';
+import deformQueryWgsl from '../shaders/deform-query.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
 
 import type { DeviceBundle } from '../gpu/device';
@@ -42,7 +45,13 @@ const RING_COUNT = Math.ceil(Math.log(RING_RMAX / RING_R0) / Math.log(RING_K)) +
 const NEAR = 0.05;
 const SUN_ANGULAR_RADIUS_DEG = 0.27;
 
-const FRAME_FLOATS = 52;
+const FRAME_FLOATS = 56;
+/** 変形の場: 1024² × 0.1m = 102.4m 四方をカメラ周りにトーラス状（wrap）に持つ。窓の外に出た変形は失われる */
+const DEFORM_SIZE = 1024;
+const DEFORM_TEXEL = 0.1;
+/** 固定刻み。壁時計を使わないので筋書きは再現する */
+const FIXED_DT = 1 / 60;
+const MAX_STAMPS = 32;
 /** 風の場のテクスチャ: 512² × 1.2m = 614m 四方をカメラ周りに毎フレーム焼く */
 const WIND_SIZE = 512;
 const WIND_TEXEL = 1.2;
@@ -87,6 +96,8 @@ const RIVER_LEVEL = -1.0;
 
 /** 稲: インスタンスの上限（compute が atomic で追記）と、頂点シェーダが生成する 1 株あたりの頂点数 */
 const RICE_MAX = 160000;
+/** インスタンス 1 件のバイト数（pos, attr, deform の 3 × vec4f） */
+const INSTANCE_STRIDE = 48;
 const RICE_NEAR_VERTS = 7 * 3 * 6;   // 葉 7 枚 × 3 節 × 6 頂点
 const RICE_MID_VERTS = 2 * 6;        // 交差する板 2 枚
 /** 草: 稲と同じ仕組み。葉 5 枚 × 2 節 */
@@ -177,6 +188,25 @@ export class WorldScene implements SceneRenderer {
   private treePipeline!: GPURenderPipeline;
   private treeDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
   private treeStats = { total: 0, variants: [] as { name: string; vertices: number; instances: number }[] };
+
+  // ---- 変形の場 ----
+  private deformTex: GPUTexture[] = [];
+  private rippleTex: GPUTexture[] = [];
+  private deformPing = 0;
+  private deformUpdatePipeline!: GPUComputePipeline;
+  private deformUpdateBindGroups: GPUBindGroup[] = [];
+  private deformQueryPipeline!: GPUComputePipeline;
+  private probePoints: [number, number][] = [];
+  private probeResults: { x: number; z: number; sink: number; bendX: number; bendZ: number; bend: number; turbidity: number; ripple: number; inside: boolean }[] = [];
+  private skyLutBindGroups: GPUBindGroup[] = [];
+  private deformParams!: GPUBuffer;
+  private stampBuffer!: GPUBuffer;
+  private pendingStamps: { x: number; z: number; radius: number; kind: number; dirX: number; dirZ: number; depth: number; bend: number }[] = [];
+  private deformOrigin: [number, number] = [0, 0];
+  private deformPrevOrigin: [number, number] = [0, 0];
+  private frameIndex = 0;
+  /** 歩き手の位置（変形を起こす主体）。段階2で移動が入るまでは視点の足元 */
+  walker = { x: 0, z: 0, yawDeg: 0 };
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -212,12 +242,12 @@ export class WorldScene implements SceneRenderer {
     this.device = device;
 
     // 稲のインスタンスバッファ（group 3 に光・材質と同居させるので先に作る）
-    this.riceNearBuf = device.createBuffer({ size: RICE_MAX * 32, usage: GPUBufferUsage.STORAGE });
-    this.riceMidBuf = device.createBuffer({ size: RICE_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.riceNearBuf = device.createBuffer({ size: RICE_MAX * INSTANCE_STRIDE, usage: GPUBufferUsage.STORAGE });
+    this.riceMidBuf = device.createBuffer({ size: RICE_MAX * INSTANCE_STRIDE, usage: GPUBufferUsage.STORAGE });
     this.riceArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(this.riceArgs, 0, new Uint32Array([RICE_NEAR_VERTS, 0, 0, 0, RICE_MID_VERTS, 0, 0, 0]));
-    this.grassNearBuf = device.createBuffer({ size: GRASS_MAX * 32, usage: GPUBufferUsage.STORAGE });
-    this.grassMidBuf = device.createBuffer({ size: GRASS_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.grassNearBuf = device.createBuffer({ size: GRASS_MAX * INSTANCE_STRIDE, usage: GPUBufferUsage.STORAGE });
+    this.grassMidBuf = device.createBuffer({ size: GRASS_MAX * INSTANCE_STRIDE, usage: GPUBufferUsage.STORAGE });
     this.grassArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(this.grassArgs, 0, new Uint32Array([GRASS_NEAR_VERTS, 0, 0, 0, GRASS_MID_VERTS, 0, 0, 0]));
 
@@ -226,7 +256,7 @@ export class WorldScene implements SceneRenderer {
     this.queryModule = queryModule;
     const terrainModule = await this.makeModule(
       'terrain',
-      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + windWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + windWgsl + deformWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
     );
     const heightmapModule = await this.makeModule('heightmap', worldCode + frameWgsl + heightsampleWgsl + shadowWgsl + heightmapWgsl);
     const skyModule = await this.makeModule('sky', commonWgsl + noiseWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + windWgsl + skyWgsl);
@@ -428,21 +458,39 @@ export class WorldScene implements SceneRenderer {
         { binding: 5, visibility: vis, buffer: { type: 'read-only-storage' } },
         { binding: 6, visibility: vis, texture: { sampleType: 'float' } },
         { binding: 7, visibility: vis, sampler: { type: 'filtering' } },
+        { binding: 8, visibility: vis, texture: { sampleType: 'float' } },
+        { binding: 9, visibility: vis, texture: { sampleType: 'float' } },
+        { binding: 10, visibility: vis, sampler: { type: 'filtering' } },
       ],
     });
-    this.skyLutBindGroup = device.createBindGroup({
-      layout: skyLutLayout,
-      entries: [
-        { binding: 0, resource: this.skyLutTex.createView() },
-        { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' }) },
-        { binding: 2, resource: { buffer: this.skyIrrBuffer } },
-        { binding: 3, resource: this.aerialInTex.createView() },
-        { binding: 4, resource: this.aerialTrTex.createView() },
-        { binding: 5, resource: { buffer: this.sunLutBuffer } },
-        { binding: 6, resource: this.windTex.createView() },
-        { binding: 7, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
-      ],
-    });
+    // 変形の場（ping-pong の 2 組）
+    for (let i = 0; i < 2; i++) {
+      this.deformTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
+      this.rippleTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
+    }
+    const deformSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' });
+    const skySampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
+    const windSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+    for (let i = 0; i < 2; i++) {
+      this.skyLutBindGroups.push(device.createBindGroup({
+        layout: skyLutLayout,
+        entries: [
+          { binding: 0, resource: this.skyLutTex.createView() },
+          { binding: 1, resource: skySampler },
+          { binding: 2, resource: { buffer: this.skyIrrBuffer } },
+          { binding: 3, resource: this.aerialInTex.createView() },
+          { binding: 4, resource: this.aerialTrTex.createView() },
+          { binding: 5, resource: { buffer: this.sunLutBuffer } },
+          { binding: 6, resource: this.windTex.createView() },
+          { binding: 7, resource: windSampler },
+          { binding: 8, resource: this.deformTex[i].createView() },
+          { binding: 9, resource: this.rippleTex[i].createView() },
+          { binding: 10, resource: deformSampler },
+        ],
+      }));
+    }
+    this.skyLutBindGroup = this.skyLutBindGroups[0];
+
 
     // --- リングメッシュのインデックス ---
     const indices = buildRingIndices(RING_COUNT, RING_SECTORS);
@@ -465,6 +513,53 @@ export class WorldScene implements SceneRenderer {
     const lightLayout = await this.bakeNormalShadow(heightmapModule, frameLayout, heightLayout);
     const frameAndHeight = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, lightLayout] });
 
+    // 変形の場の更新 compute（読み i → 書き 1-i）
+    this.deformParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.stampBuffer = device.createBuffer({ size: MAX_STAMPS * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const deformUpdateLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    });
+    const deformModule = await this.makeModule('deformUpdate', commonWgsl + noiseWgsl + heightsampleWgsl + deformUpdateWgsl);
+    this.deformUpdatePipeline = device.createComputePipeline({
+      label: 'deformUpdate',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, deformUpdateLayout] }),
+      compute: { module: deformModule, entryPoint: 'deformUpdate' },
+    });
+    const deformQueryModule = await this.makeModule('deformQuery', commonWgsl + noiseWgsl + frameWgsl + heightsampleWgsl + skylutWgsl + windWgsl + deformWgsl + deformQueryWgsl);
+    const dqLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    this.deformQueryPipeline = device.createComputePipeline({
+      label: 'deformQuery',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, dqLayout] }),
+      compute: { module: deformQueryModule, entryPoint: 'deformQuery' },
+    });
+    for (let i = 0; i < 2; i++) {
+      this.deformUpdateBindGroups.push(device.createBindGroup({
+        layout: deformUpdateLayout,
+        entries: [
+          { binding: 0, resource: this.matTex.createView({ dimension: '2d-array' }) },
+          { binding: 1, resource: this.deformTex[i].createView() },
+          { binding: 2, resource: this.rippleTex[i].createView() },
+          { binding: 3, resource: this.deformTex[1 - i].createView() },
+          { binding: 4, resource: this.rippleTex[1 - i].createView() },
+          { binding: 5, resource: { buffer: this.stampBuffer } },
+          { binding: 6, resource: { buffer: this.deformParams } },
+        ],
+      }));
+    }
+
     this.terrainPipeline = device.createRenderPipeline({
       label: 'terrain',
       layout: frameAndHeight,
@@ -476,7 +571,7 @@ export class WorldScene implements SceneRenderer {
     });
     const waterModule = await this.makeModule(
       'water',
-      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + waterWgsl,
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + deformWgsl + waterWgsl,
     );
     this.waterPipeline = device.createRenderPipeline({
       label: 'water',
@@ -494,7 +589,7 @@ export class WorldScene implements SceneRenderer {
 
     // --- 稲 ---
     {
-      const riceCommon = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      const riceCommon = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + deformWgsl;
       // rice.wgsl は 共通 / 生成 / 描画 の 3 節。頂点シェーダは read_write の storage を参照できないので別モジュールに組む
       const section = (name: string): string => {
         const start = riceWgsl.indexOf(`// ==== SECTION: ${name} ====`);
@@ -528,7 +623,7 @@ export class WorldScene implements SceneRenderer {
 
     // --- 草（稲と同じ仕組み） ---
     {
-      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + deformWgsl;
       const section = (src: string, name: string): string => {
         const start = src.indexOf(`// ==== SECTION: ${name} ====`);
         const rest = src.slice(start);
@@ -560,7 +655,7 @@ export class WorldScene implements SceneRenderer {
 
     // --- 木 ---
     {
-      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + deformWgsl;
       const section = (src: string, name: string): string => {
         const start = src.indexOf(`// ==== SECTION: ${name} ====`);
         const rest = src.slice(start);
@@ -1094,7 +1189,7 @@ export class WorldScene implements SceneRenderer {
     f.set([right[0], right[1], right[2], 0], 24);
     f.set([up[0], up[1], up[2], Math.tan(fov / 2)], 28);
     f.set([sunDir[0], sunDir[1], sunDir[2], Math.cos((SUN_ANGULAR_RADIUS_DEG * Math.PI) / 180)], 32);
-    f.set([v.time, v.exposure, aspect, v.debug], 36);
+    f.set([v.time + this.frameIndex * FIXED_DT, v.exposure, aspect, v.debug], 36);
     f.set([RING_R0, RING_K, RING_COUNT, RING_SECTORS], 40);
     f.set([eye[0], eye[2], resolution.width, resolution.height], 44);
     const windExtent = WIND_SIZE * WIND_TEXEL;
@@ -1103,11 +1198,118 @@ export class WorldScene implements SceneRenderer {
       Math.floor((eye[2] - windExtent / 2) / WIND_TEXEL) * WIND_TEXEL,
       WIND_TEXEL, WIND_SIZE,
     ], 48);
+    f.set([this.deformOrigin[0], this.deformOrigin[1], DEFORM_TEXEL, DEFORM_SIZE], 52);
     this.device.queue.writeBuffer(this.frameBuffer, 0, f);
+  }
+
+  /** 変形の場を世界座標で読み戻す（検証用）。現在の ping 側を読む */
+  async probeDeform(points: [number, number][]): Promise<typeof this.probeResults> {
+    const device = this.device;
+    const n = points.length;
+    if (n === 0) return [];
+    const inBuf = device.createBuffer({ size: n * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(inBuf, 0, new Float32Array(points.flat()));
+    const outBuf = device.createBuffer({ size: n * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: n * 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const bg = device.createBindGroup({
+      layout: this.deformQueryPipeline.getBindGroupLayout(3),
+      entries: [{ binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.deformQueryPipeline);
+    pass.setBindGroup(0, this.frameBindGroup);
+    pass.setBindGroup(1, this.heightBindGroup);
+    pass.setBindGroup(2, this.skyLutBindGroups[this.deformPing]);
+    pass.setBindGroup(3, bg);
+    pass.dispatchWorkgroups(Math.ceil(n / 64));
+    pass.end();
+    encoder.copyBufferToBuffer(outBuf, 0, readBuf, 0, n * 32);
+    device.queue.submit([encoder.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+    inBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+    const out = points.map(([x, z], i) => ({
+      x, z,
+      sink: v[i * 4], bendX: v[i * 4 + 1], bendZ: v[i * 4 + 2],
+      bend: Math.hypot(v[i * 4 + 1], v[i * 4 + 2]),
+      turbidity: Math.max(0, v[i * 4 + 3]),
+      ripple: v[(n + i) * 4],
+      inside: v[i * 4 + 3] >= 0,
+    }));
+    this.probeResults = out;
+    return out;
+  }
+
+  /** 撮影後に読む観測点（URL の probe=x,z;x,z）。世界座標。'eye' 相対も書ける: e+dx,dz */
+  setProbePoints(points: [number, number][]): void {
+    this.probePoints = points;
+  }
+
+  /** 踏み跡を予約する（次のフレームの更新で書き込まれる） */
+  addStamp(x: number, z: number, radius: number, kind: number, dirX: number, dirZ: number, depth: number, bend: number): void {
+    if (this.pendingStamps.length < MAX_STAMPS) this.pendingStamps.push({ x, z, radius, kind, dirX, dirZ, depth, bend });
+  }
+
+  /** 段階1の検証用: 視点の向きへ歩いた足跡の列を最初のフレームに置く（dbg=20） */
+  private testStamps(): void {
+    const wx = this.resolved.eyeXZ[0];
+    const wz = this.resolved.eyeXZ[1];
+    const yaw = (this.view.yawDeg * Math.PI) / 180;
+    const fx = Math.sin(yaw), fz = Math.cos(yaw);
+    const rx = Math.cos(yaw), rz = -Math.sin(yaw);
+    for (let i = 0; i < 26; i++) {
+      const d = 1.2 + i * 0.66;
+      const side = (i % 2 === 0 ? -1 : 1) * 0.12;
+      const x = wx + fx * d + rx * side;
+      const z = wz + fz * d + rz * side;
+      this.addStamp(x, z, 0.16, 0, fx, fz, 0.12, 0.9);
+      this.addStamp(wx + fx * d, wz + fz * d, 0.45, 1, fx, fz, 0, 0.85);
+    }
+  }
+
+  /** 変形の場を 1 歩進める（毎フレーム）。窓の原点は歩き手（＝視点）に追従 */
+  private stepDeform(encoder: GPUCommandEncoder): void {
+    const extent = DEFORM_SIZE * DEFORM_TEXEL;
+    this.deformPrevOrigin = this.deformOrigin;
+    this.deformOrigin = [
+      Math.floor((this.walker.x - extent / 2) / DEFORM_TEXEL) * DEFORM_TEXEL,
+      Math.floor((this.walker.z - extent / 2) / DEFORM_TEXEL) * DEFORM_TEXEL,
+    ];
+    if (this.frameIndex === 0) {
+      // 最初のフレームは全面を 0 に（前の窓＝遠くの偽の窓にしておけば「新しく入った」扱いになる）
+      this.deformPrevOrigin = [this.deformOrigin[0] + 1e6, this.deformOrigin[1] + 1e6];
+      if (this.view.debug === 20) this.testStamps();
+    }
+    const stamps = new Float32Array(MAX_STAMPS * 8);
+    this.pendingStamps.forEach((st, i) => stamps.set([st.x, st.z, st.radius, st.kind, st.dirX, st.dirZ, st.depth, st.bend], i * 8));
+    this.device.queue.writeBuffer(this.stampBuffer, 0, stamps);
+    this.device.queue.writeBuffer(this.deformParams, 0, new Float32Array([
+      this.deformPrevOrigin[0], this.deformPrevOrigin[1], this.deformOrigin[0], this.deformOrigin[1],
+      DEFORM_TEXEL, DEFORM_SIZE, FIXED_DT, this.pendingStamps.length,
+    ]));
+    this.pendingStamps = [];
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.deformUpdatePipeline);
+    pass.setBindGroup(0, this.frameBindGroup);
+    pass.setBindGroup(1, this.heightBindGroup);
+    pass.setBindGroup(2, this.skyLutBindGroups[this.deformPing]);
+    pass.setBindGroup(3, this.deformUpdateBindGroups[this.deformPing]);
+    pass.dispatchWorkgroups(DEFORM_SIZE / 8, DEFORM_SIZE / 8);
+    pass.end();
+    this.deformPing = 1 - this.deformPing;
+    this.skyLutBindGroup = this.skyLutBindGroups[this.deformPing];
   }
 
   render(ctx: FrameContext): void {
     const { encoder } = ctx;
+    this.frameIndex = ctx.frameIndex;
+    if (ctx.frameIndex === 0) this.walker = { x: this.resolved.eyeXZ[0], z: this.resolved.eyeXZ[1], yawDeg: this.view.yawDeg };
+    // 変形の場を進めてから、フレーム定数（時刻・窓の原点）を書く
+    this.stepDeform(encoder);
+    this.updateFrame();
     const hdrView = MSAA_SAMPLES > 1 ? this.hdrMsaa.createView() : this.hdr.createView();
     const resolveView = this.hdr.createView();
     const depthView = this.depth.createView();
@@ -1213,6 +1415,7 @@ export class WorldScene implements SceneRenderer {
 
   async afterRun(): Promise<void> {
     await this.readRiceCounts();
+    if (this.probePoints.length > 0) await this.probeDeform(this.probePoints);
   }
 
   /** 稲のインスタンス数（直近フレーム）を読み戻す。レポート用 */
@@ -1248,6 +1451,8 @@ export class WorldScene implements SceneRenderer {
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },
       trees: this.treeStats,
+      deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
+      probe: this.probeResults,
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,

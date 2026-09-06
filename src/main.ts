@@ -71,6 +71,17 @@ async function runView(): Promise<void> {
   let report: ViewReport;
   try {
     const scene = new WorldScene(view);
+    // 検証用の観測点: probe=x,z;x,z（世界座標）または e+dx,dz（視点相対）
+    const probeRaw = params.get('probe');
+    if (probeRaw) {
+      const pts: [number, number][] = [];
+      for (const item of probeRaw.split(';')) {
+        const rel = item.startsWith('e');
+        const [a, b] = item.replace(/^e\+?/, '').split(',').map(Number);
+        if (Number.isFinite(a) && Number.isFinite(b)) pts.push(rel ? [view.eye.x + a, view.eye.z + b] : [a, b]);
+      }
+      scene.setProbePoints(pts);
+    }
     const result = await runScene(canvas, scene, () => {
       window.__yugure.firstFrameDone = true;
     });
