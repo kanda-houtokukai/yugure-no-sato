@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types", "vite/client"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  // vite.config.ts は Node の型（@types/node）が要るが、devDependencies を
+  // vite / typescript / @webgpu/types の3点に保つ方針のため型検査の対象外にする。
+  // Vite は設定ファイルを実行時にトランスパイルするだけで、型検査を必要としない。
+  "include": ["src"]
+}

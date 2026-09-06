@@ -9,18 +9,21 @@
 
 ## 今どこか
 
-**セットアップ完了、実装は未着手。**（2026-09-06）
+**フェーズ0（自己修正ループの構築）の停止ポイント① まで完了。承認待ち。**（2026-09-06）
 
-リポジトリ・CLAUDE.md・台帳・決定事項リストの初期化まで終わった。
-アプリのソースコード・`package.json` はまだ1行も無い。依存パッケージも未インストール。
-GitHub Pages も未設定。
+Vite + TypeScript の最小プロジェクトを作り、**WebGPU が実際に取れることを機械確認した**
+（結果は下記「WebGPU 環境（確定・2026-09-06 実測）」）。
+自己修正ループの本体（スクショ自動化・ゴールデンビュー・自己点検レポート・`npm run verify`）は未着手。
+田園・神社・人物・地形変形はもちろん未着手。GitHub Pages も未設定。
 
 ## 次の一手
 
-**フェーズ0: 自己修正ループの構築**（次の指示で扱う）。
+**停止ポイント①の承認後、フェーズ0 本体（A〜D）に着手する。**
 
-Code がブラウザを自動起動しスクショを撮って、崩れを自分で見て直す仕組みを作る。
-**描画コードより先に**作る（→ [DECISION] 10）。
+- A: Playwright でスクショ自動化（検証ツールなので絶対規則2の例外として許可済み）
+- B: ゴールデンビュー3つ（正面・俯瞰・地面すれすれ）。検証用の仮表示は市松模様の地面＋空のグラデーションのみ
+- C: 自己点検レポート（平均輝度と分散・極端輝度の比率・GPU エラー件数・フレーム時間）→ `.screenshots/report-<日時>.json`
+- D: `npm run verify` の一括実行（dev 起動 → 3視点スクショ → レポート → 停止）
 
 ## 決定事項（正本は別ファイル）
 
@@ -51,9 +54,15 @@ Code がブラウザを自動起動しスクショを撮って、崩れを自分
 - ⚠️ **区切りごとに push して SHA を報告する。** 設計側は raw で裏取りするため、
   push 済みでないものは存在しないものとして扱われる。
 - ⚠️ **public を維持する。** private 化すると設計側の裏取り手段が消える。
-- 📋 **未検証（フェーズ0で解消予定）**: この Mac の Chrome 152 安定版で WebGPU（`navigator.gpu`）が
-  実際に取れるかは未確認。Canary は未インストール。フェーズ0の最初に機械確認する。
-  ここが×なら Canary 導入の判断が必要になる（＝停止して報告する事項）。
+- ✅ **解消済み（2026-09-06）**: Chrome 152 安定版で WebGPU が取れることを機械確認した。
+  **Canary は不要**（下記「WebGPU 環境」）。
+- ⚠️ **`npm install` はグローバル設定の deny で止まる**（`~/.claude/settings.json` の `Bash(npm install*)`）。
+  これは意図的なガード。Code が勝手に外さず、**神田さんに自分のターミナルで実行してもらう運用**とする
+  （2026-09-06 に本人が選択）。依存を足す必要が出たら、コマンドを提示して待つ。
+- ⚠️ **`@types/node` を入れない。** devDependencies を vite / typescript / @webgpu/types の3点に保つため、
+  `vite.config.ts` は `tsconfig.json` の型検査対象から外してある（`include: ["src"]`）。
+  Vite は設定ファイルを実行時にトランスパイルするだけなので実害はないが、
+  **`vite.config.ts` の型は機械保証の外**である点は把握しておくこと。
 
 ## ブロッカー
 
@@ -71,12 +80,38 @@ Code がブラウザを自動起動しスクショを撮って、崩れを自分
 | `.gitignore` | node_modules / dist ほか | ○ |
 | `docs/yugure-no-sato-archive-YYYY-MM.md` | 経緯アーカイブ（まだ存在しない。台帳が規定を超えたら作る） | — |
 
+## WebGPU 環境（確定・2026-09-06 実測）
+
+`node tools/probe.mjs` による実測。**Chrome の起動条件4通りすべてで WebGPU が取れた。**
+
+| 起動条件 | 結果 |
+|---|---|
+| headed（フラグなし） | ✅ |
+| headed + `--enable-unsafe-webgpu` | ✅ |
+| **`--headless=new`（フラグなし）** | ✅ |
+| `--headless=new` + `--enable-unsafe-webgpu` + `--use-angle=metal` | ✅ |
+
+- **特別な起動フラグは不要。** `--enable-unsafe-webgpu` も `--use-angle=metal` も要らない。
+- **ヘッドレスでも WebGPU が動く。** パートAで想定していた「ヘッドレスでは動かない」懸念は外れた。
+- アダプタ: `vendor: apple` / `architecture: metal-3` / subgroup サイズ 32 固定
+- `preferredCanvasFormat: bgra8unorm`
+- 主要な上限値: `maxBufferSize` **4,294,967,292**（約4GiB）／`maxStorageBufferBindingSize` 同値／
+  `maxComputeWorkgroupSizeX,Y` 1024・`Z` 64／`maxComputeInvocationsPerWorkgroup` 1024／
+  `maxComputeWorkgroupsPerDimension` 65,535／`maxComputeWorkgroupStorageSize` 32,768／
+  `maxTextureDimension2D` 16,384／`maxStorageBuffersPerShaderStage` 10／`maxColorAttachments` 8
+- 使える主な機能: `shader-f16`・`subgroups`（size-control 付き）・`timestamp-query`・`float32-filterable`・
+  `float32-blendable`・`dual-source-blending`・`depth-clip-control`・`bgra8unorm-storage`・
+  `primitive-index`・`clip-distances`
+- 全文は `.screenshots/probe-attempts.json`（gitignore 済み）。再取得は `node tools/probe.mjs`。
+
 ## 環境（2026-09-06 実測）
 
 - Node.js **v24.16.0** / npm 11.13.0
 - gh CLI: ログイン済み `kanda-houtokukai`（scopes: gist, read:org, repo, workflow）
 - ブラウザ: **Google Chrome 152.0.7977.76 安定版のみ**。Chrome Canary・Chromium・Edge は未インストール
 - git 2.50.1
+- 導入済み devDependencies: vite **8.2.2** / typescript **7.0.2** / @webgpu/types **0.1.72**
+  （`dependencies` は空。描画・数学ライブラリは無し＝絶対規則2）
 
 ---
 
