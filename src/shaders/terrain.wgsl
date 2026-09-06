@@ -70,6 +70,19 @@ fn fs(in: VSOut) -> FSOut {
   let ambient = skyAmbient(n);
   var color = albedo * (ndl * shadow * sunLight + ambient);
 
+  // 遠くの田（110m 超）は水面と株を描かず、地形の側で稲の面として描く（水面は 170m 超で discard する）。
+  // 風の場で明暗が渡る＝田の面を風が渡る画。近くは水面＋株が上に重なる
+  if (baked.kind == 1u && dist > 110.0 && dbg != 12.0) {
+    let canopyBlend = smootherstep(110.0, 170.0, dist);
+    let wind = windAt(p);
+    let riceAlbedo = vec3f(0.11, 0.30, 0.07);
+    let lit = 0.55 + 0.45 * wind.strength;
+    let toward = pow(max(dot(viewDir, -sun), 0.0), 3.0);
+    let canopy = riceAlbedo * (lit * max(sun.y, 0.0) * 4.0 * sunLight * shadow + ambient)
+      + vec3f(0.22, 0.55, 0.10) * toward * 0.25 * sunLight * shadow * (0.5 + 0.5 * wind.strength);
+    color = mix(color, canopy, canopyBlend);
+  }
+
   // 遠景の溶け込み（3D LUT）
   let air = aerialLut(-viewDir, dist);
   color = color * air.transmittance + air.inscatter;

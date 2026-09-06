@@ -39,8 +39,8 @@ fn rippleNormal(p: vec2f, footprint: f32) -> vec3f {
     dx += w.x * slope;
     dz += w.y * slope;
   }
-  // 局所的な風のむらで波を強弱させる
-  let gust = 0.55 + 0.45 * gnoise(p / 9.0 + vec2f(t * 0.05, 0.0), 91u);
+  // 風の場（焼いたもの 1 タップ）で波を強弱させる。稲を渡る風と同じ場
+  let gust = 0.4 + 0.8 * windAt(p).strength;
   return normalize(vec3f(-dx * gust, 1.0, -dz * gust));
 }
 
@@ -48,11 +48,13 @@ fn rippleNormal(p: vec2f, footprint: f32) -> vec3f {
 fn fs(in: VSOut) -> @location(0) vec4f {
   let toCam = frame.camPos.xyz - in.world;
   let dist = length(toCam);
+  // 遠くの田は地形側が稲の面として描く。ここで捨てて重い経路（さざ波・映り込み）を通さない
+  if (dist > 170.0) { discard; }
   let v = toCam / dist;
   let sun = frame.sunDir.xyz;
   // 画素の足元。水面をかすめる視線では奥行き方向に伸びる
   let footprint = dist * frame.camUp.w * 2.0 / frame.center.w / max(abs(v.y), 0.05);
-  let n = rippleNormal(in.world.xz, footprint);
+  let n = select(rippleNormal(in.world.xz, footprint), vec3f(0.0, 1.0, 0.0), frame.params.w == 16.0);   // 計測用 dbg=16: さざ波なし
 
   // ---- 映り込み ----
   let r = reflect(-v, n);

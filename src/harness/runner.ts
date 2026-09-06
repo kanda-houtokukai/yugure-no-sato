@@ -44,6 +44,8 @@ export interface SceneRenderer {
   /** パイプラインと資源を作る。compute で CPU が要る値を読み戻すのもここ */
   init(bundle: DeviceBundle, canvasFormat: GPUTextureFormat): Promise<void>;
   render(ctx: FrameContext): void;
+  /** 描画ループの後に GPU から読み戻すものがあれば */
+  afterRun?(): Promise<void>;
   /** レポートに載せるシーン固有の情報 */
   describe(): unknown;
   shaderMessages(): ShaderMessage[];
@@ -207,6 +209,7 @@ export async function runScene(
     quantumNs: null,
   };
 
+  if (scene.afterRun) await scene.afterRun();
   await popErrorScopes(device, errors);
 
   const adapterInfo: Record<string, string> = {};

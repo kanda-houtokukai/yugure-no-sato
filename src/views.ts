@@ -42,6 +42,8 @@ export const VIEWS: Readonly<Record<string, View>> = {
   // 主道の上、地面すれすれから北へ
   ground: { name: 'ground', eye: { x: 0.9, z: -70, above: 0.12 }, snap: { family: 0, index: 0, offset: 0.3 }, yawDeg: 0, pitchDeg: 1, fovDeg: 65, ...base },
   // 畦（縦線 -1）の上にしゃがみ、夕日の方向へ田の水面を見る（水面の見せ場）
+  // 風が田を渡る様子を見る専用視点（verify の 4 視点には含めない）: 主道の上 2.5m から西の田を逆光で見渡す
+  wind: { name: 'wind', eye: { x: 0, z: -40, above: 2.5 }, snap: { family: 0, index: 0, offset: 0 }, yawDeg: 290, pitchDeg: -6, fovDeg: 60, ...base },
   water: { name: 'water', eye: { x: -26, z: 22, above: 0.9 }, snap: { family: 0, index: -1, offset: 0 }, glintCheck: true, yawDeg: 272, pitchDeg: -3, fovDeg: 55, ...base },
 };
 

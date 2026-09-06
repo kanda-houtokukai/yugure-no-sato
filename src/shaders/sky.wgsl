@@ -118,3 +118,15 @@ fn bakeSunLut(@builtin(global_invocation_id) id: vec3u) {
   let t = sunTransmittance(toPlanet(vec3f(frame.camPos.x, h, frame.camPos.z)), frame.sunDir.xyz, 12);
   sunLutOut[id.x] = vec4f(SUN_E * t, 0.0);
 }
+
+// ---- 風の場の焼き込み（毎フレーム） ----
+@group(0) @binding(7) var windOut: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn bakeWind(@builtin(global_invocation_id) id: vec3u) {
+  let n = u32(frame.wind.w);
+  if (id.x >= n || id.y >= n) { return; }
+  let p = frame.wind.xy + (vec2f(f32(id.x), f32(id.y)) + 0.5) * frame.wind.z;
+  let w = windField(p, frame.params.x);
+  textureStore(windOut, vec2i(id.xy), vec4f(w.bend, w.strength, 0.0));
+}

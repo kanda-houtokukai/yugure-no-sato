@@ -16,6 +16,8 @@ import skylutWgsl from '../shaders/skylut.wgsl?raw';
 import shadowWgsl from '../shaders/shadow.wgsl?raw';
 import lightsampleWgsl from '../shaders/lightsample.wgsl?raw';
 import waterWgsl from '../shaders/water.wgsl?raw';
+import windWgsl from '../shaders/wind.wgsl?raw';
+import riceWgsl from '../shaders/rice.wgsl?raw';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
@@ -37,7 +39,10 @@ const RING_COUNT = Math.ceil(Math.log(RING_RMAX / RING_R0) / Math.log(RING_K)) +
 const NEAR = 0.05;
 const SUN_ANGULAR_RADIUS_DEG = 0.27;
 
-const FRAME_FLOATS = 48;
+const FRAME_FLOATS = 52;
+/** 風の場のテクスチャ: 512² × 1.2m = 614m 四方をカメラ周りに毎フレーム焼く */
+const WIND_SIZE = 512;
+const WIND_TEXEL = 1.2;
 /**
  * MSAA は使わない（既定 1）。Chrome/Metal で 4× MSAA にすると 1 フレーム 200ms になった（実測、DPR1 でも）。
  * 輪郭の平滑化はトーンマップ時の FXAA で行う。?msaa=4 で再実験できる
@@ -76,6 +81,11 @@ const RIVER_X1 = 900;
 const RIVER_STEP = 4;
 const RIVER_HALF = 3.2;
 const RIVER_LEVEL = -1.0;
+
+/** 稲: インスタンスの上限（compute が atomic で追記）と、頂点シェーダが生成する 1 株あたりの頂点数 */
+const RICE_MAX = 160000;
+const RICE_NEAR_VERTS = 7 * 3 * 6;   // 葉 7 枚 × 3 節 × 6 頂点
+const RICE_MID_VERTS = 2 * 6;        // 交差する板 2 枚
 
 function buildRingIndices(rings: number, sectors: number): Uint32Array {
   const fan = sectors * 3;
@@ -134,8 +144,21 @@ export class WorldScene implements SceneRenderer {
   private aerialInTex!: GPUTexture;
   private aerialTrTex!: GPUTexture;
   private sunLutBuffer!: GPUBuffer;
+  private windTex!: GPUTexture;
+  private windPipeline!: GPUComputePipeline;
+  private windBindGroup!: GPUBindGroup;
   private lightBakeMs = 0;
   private waterPipeline!: GPURenderPipeline;
+  private riceSpawnNear!: GPUComputePipeline;
+  private riceSpawnMid!: GPUComputePipeline;
+  private riceNearPipeline!: GPURenderPipeline;
+  private riceMidPipeline!: GPURenderPipeline;
+  private riceArgs!: GPUBuffer;
+  private riceNearBuf!: GPUBuffer;
+  private riceMidBuf!: GPUBuffer;
+  private riceComputeBindGroup!: GPUBindGroup;
+  private riceComputeLayout!: GPUBindGroupLayout;
+  private riceCounts = { near: 0, mid: 0 };
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -170,15 +193,21 @@ export class WorldScene implements SceneRenderer {
     const device = bundle.device;
     this.device = device;
 
+    // 稲のインスタンスバッファ（group 3 に光・材質と同居させるので先に作る）
+    this.riceNearBuf = device.createBuffer({ size: RICE_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.riceMidBuf = device.createBuffer({ size: RICE_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.riceArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    device.queue.writeBuffer(this.riceArgs, 0, new Uint32Array([RICE_NEAR_VERTS, 0, 0, 0, RICE_MID_VERTS, 0, 0, 0]));
+
     const worldCode = commonWgsl + noiseWgsl + worldWgsl;
     const queryModule = await this.makeModule('query', worldCode + queryWgsl);
     this.queryModule = queryModule;
     const terrainModule = await this.makeModule(
       'terrain',
-      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + windWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
     );
     const heightmapModule = await this.makeModule('heightmap', worldCode + frameWgsl + heightsampleWgsl + shadowWgsl + heightmapWgsl);
-    const skyModule = await this.makeModule('sky', commonWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + skyWgsl);
+    const skyModule = await this.makeModule('sky', commonWgsl + noiseWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + windWgsl + skyWgsl);
     const tonemapModule = await this.makeModule('tonemap', commonWgsl + frameWgsl.replace('@group(0) @binding(0) var<uniform> frame: Frame;', '') + tonemapWgsl);
 
     // --- 視点を線（畦・道）へ吸着し、地面高さを正本（world.wgsl）に問い合わせる ---
@@ -340,14 +369,41 @@ export class WorldScene implements SceneRenderer {
       device.queue.submit([encoder.finish()]);
     }
 
+    // 風の場（毎フレーム焼く）
+    this.windTex = device.createTexture({
+      size: [WIND_SIZE, WIND_SIZE], format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const windBakeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+      ],
+    });
+    this.windPipeline = device.createComputePipeline({
+      label: 'bakeWind',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [windBakeLayout] }),
+      compute: { module: skyModule, entryPoint: 'bakeWind' },
+    });
+    this.windBindGroup = device.createBindGroup({
+      layout: windBakeLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameBuffer } },
+        { binding: 7, resource: this.windTex.createView() },
+      ],
+    });
+
+    const vis = GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE;
     const skyLutLayout = device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+        { binding: 0, visibility: vis, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: vis, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: vis, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: vis, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 4, visibility: vis, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 5, visibility: vis, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: vis, texture: { sampleType: 'float' } },
+        { binding: 7, visibility: vis, sampler: { type: 'filtering' } },
       ],
     });
     this.skyLutBindGroup = device.createBindGroup({
@@ -359,6 +415,8 @@ export class WorldScene implements SceneRenderer {
         { binding: 3, resource: this.aerialInTex.createView() },
         { binding: 4, resource: this.aerialTrTex.createView() },
         { binding: 5, resource: { buffer: this.sunLutBuffer } },
+        { binding: 6, resource: this.windTex.createView() },
+        { binding: 7, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
       ],
     });
 
@@ -394,7 +452,7 @@ export class WorldScene implements SceneRenderer {
     });
     const waterModule = await this.makeModule(
       'water',
-      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + waterWgsl,
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + waterWgsl,
     );
     this.waterPipeline = device.createRenderPipeline({
       label: 'water',
@@ -409,6 +467,40 @@ export class WorldScene implements SceneRenderer {
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
       multisample: { count: MSAA_SAMPLES },
     });
+
+    // --- 稲 ---
+    {
+      const riceCommon = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      // rice.wgsl は 共通 / 生成 / 描画 の 3 節。頂点シェーダは read_write の storage を参照できないので別モジュールに組む
+      const section = (name: string): string => {
+        const start = riceWgsl.indexOf(`// ==== SECTION: ${name} ====`);
+        const rest = riceWgsl.slice(start);
+        const next = rest.indexOf('// ==== SECTION:', 10);
+        return next < 0 ? rest : rest.slice(0, next);
+      };
+      const riceComputeModule = await this.makeModule('riceSpawn', riceCommon + section('common') + section('spawn'));
+      const riceRenderModule = await this.makeModule('rice', riceCommon + section('common') + section('draw'));
+
+      const computePL = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, this.riceComputeLayout] });
+      this.riceSpawnNear = device.createComputePipeline({ label: 'spawnNear', layout: computePL, compute: { module: riceComputeModule, entryPoint: 'spawnNear' } });
+      this.riceSpawnMid = device.createComputePipeline({ label: 'spawnMid', layout: computePL, compute: { module: riceComputeModule, entryPoint: 'spawnMid' } });
+      const renderPL = frameAndHeight;
+      const riceDepth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' };
+      this.riceNearPipeline = device.createRenderPipeline({
+        label: 'riceNear', layout: renderPL,
+        vertex: { module: riceRenderModule, entryPoint: 'vsNear' },
+        fragment: { module: riceRenderModule, entryPoint: 'fsNear', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: riceDepth, multisample: { count: MSAA_SAMPLES },
+      });
+      this.riceMidPipeline = device.createRenderPipeline({
+        label: 'riceMid', layout: renderPL,
+        vertex: { module: riceRenderModule, entryPoint: 'vsMid' },
+        fragment: { module: riceRenderModule, entryPoint: 'fsMid', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: riceDepth, multisample: { count: MSAA_SAMPLES },
+      });
+    }
 
     this.skyPipeline = device.createRenderPipeline({
       label: 'sky',
@@ -599,10 +691,13 @@ export class WorldScene implements SceneRenderer {
     this.lightBakeMs = performance.now() - t0;
     for (const b of scratch) b.destroy();
 
+    // 描画用: 光・材質テクスチャ ＋ 稲インスタンス（read-only）。生成 compute 用は別レイアウト（read_write）
     const layout = device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       ],
     });
     this.lightBindGroup = device.createBindGroup({
@@ -610,6 +705,27 @@ export class WorldScene implements SceneRenderer {
       entries: [
         { binding: 0, resource: this.lightTex.createView({ dimension: '2d-array' }) },
         { binding: 1, resource: this.matTex.createView({ dimension: '2d-array' }) },
+        { binding: 2, resource: { buffer: this.riceNearBuf } },
+        { binding: 3, resource: { buffer: this.riceMidBuf } },
+      ],
+    });
+    this.riceComputeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    this.riceComputeBindGroup = device.createBindGroup({
+      layout: this.riceComputeLayout,
+      entries: [
+        { binding: 0, resource: this.lightTex.createView({ dimension: '2d-array' }) },
+        { binding: 1, resource: this.matTex.createView({ dimension: '2d-array' }) },
+        { binding: 2, resource: { buffer: this.riceNearBuf } },
+        { binding: 3, resource: { buffer: this.riceMidBuf } },
+        { binding: 4, resource: { buffer: this.riceArgs } },
       ],
     });
     return layout;
@@ -818,6 +934,12 @@ export class WorldScene implements SceneRenderer {
     f.set([v.time, v.exposure, aspect, v.debug], 36);
     f.set([RING_R0, RING_K, RING_COUNT, RING_SECTORS], 40);
     f.set([eye[0], eye[2], resolution.width, resolution.height], 44);
+    const windExtent = WIND_SIZE * WIND_TEXEL;
+    f.set([
+      Math.floor((eye[0] - windExtent / 2) / WIND_TEXEL) * WIND_TEXEL,
+      Math.floor((eye[2] - windExtent / 2) / WIND_TEXEL) * WIND_TEXEL,
+      WIND_TEXEL, WIND_SIZE,
+    ], 48);
     this.device.queue.writeBuffer(this.frameBuffer, 0, f);
   }
 
@@ -826,37 +948,63 @@ export class WorldScene implements SceneRenderer {
     const hdrView = MSAA_SAMPLES > 1 ? this.hdrMsaa.createView() : this.hdr.createView();
     const resolveView = this.hdr.createView();
     const depthView = this.depth.createView();
+    const skipRice = this.view.debug === 13;   // 計測用: 稲の生成と描画を丸ごと飛ばす
+    const skipSpawn = skipRice || this.view.debug === 14;   // 14: 生成だけ飛ばす
+    const skipRiceDraw = skipRice || this.view.debug === 15;   // 15: 描画だけ飛ばす
 
-    // 1. 地形（HDR へ。深度は逆 Z で 0 クリア）。空の LUT は起動時に焼いてある
-    const terrain = encoder.beginRenderPass({
+    // -1. 風の場を焼く（毎フレーム。稲・水面・草・木が同じ場を 1 タップで読む）
+    {
+      const wind = encoder.beginComputePass();
+      wind.setPipeline(this.windPipeline);
+      wind.setBindGroup(0, this.windBindGroup);
+      wind.dispatchWorkgroups(WIND_SIZE / 8, WIND_SIZE / 8);
+      wind.end();
+    }
+
+    // 0. 稲のインスタンスをカメラ周りに生成（毎フレーム。フェーズ3で歩いても追従する）
+    encoder.clearBuffer(this.riceArgs, 4, 4);
+    encoder.clearBuffer(this.riceArgs, 20, 4);
+    if (!skipSpawn) {
+      const spawn = encoder.beginComputePass();
+      spawn.setBindGroup(0, this.frameBindGroup);
+      spawn.setBindGroup(1, this.heightBindGroup);
+      spawn.setBindGroup(2, this.skyLutBindGroup);
+      spawn.setBindGroup(3, this.riceComputeBindGroup);
+      spawn.setPipeline(this.riceSpawnNear);
+      spawn.dispatchWorkgroups(272 / 8, 368 / 8);
+      spawn.setPipeline(this.riceSpawnMid);
+      spawn.dispatchWorkgroups(336 / 8, 336 / 8);
+      spawn.end();
+    }
+
+    // 1. 地形 → 水面 → 稲 を 1 つの render pass で（パスを分けると HDR/深度の読み書きが毎回掛かる。実測 2.3ms/パス）
+    const scene = encoder.beginRenderPass({
       colorAttachments: [{ view: hdrView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
       depthStencilAttachment: { view: depthView, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' },
       ...(ctx.tsBegin ? { timestampWrites: ctx.tsBegin } : {}),
     });
-    terrain.setPipeline(this.terrainPipeline);
-    terrain.setBindGroup(0, this.frameBindGroup);
-    terrain.setBindGroup(1, this.heightBindGroup);
-    terrain.setBindGroup(2, this.skyLutBindGroup);
-    terrain.setBindGroup(3, this.lightBindGroup);
-    terrain.setIndexBuffer(this.indexBuffer, 'uint32');
-    terrain.drawIndexed(this.indexCount);
-    terrain.end();
-
+    scene.setBindGroup(0, this.frameBindGroup);
+    scene.setBindGroup(1, this.heightBindGroup);
+    scene.setBindGroup(2, this.skyLutBindGroup);
+    scene.setBindGroup(3, this.lightBindGroup);
+    // 1a. 地形（リングメッシュ、1 draw call）
+    scene.setPipeline(this.terrainPipeline);
+    scene.setIndexBuffer(this.indexBuffer, 'uint32');
+    scene.drawIndexed(this.indexCount);
     // 1b. 水面（田と小川）
     if (this.waterVertexCount > 0) {
-      const water = encoder.beginRenderPass({
-        colorAttachments: [{ view: hdrView, loadOp: 'load', storeOp: 'store' }],
-        depthStencilAttachment: { view: depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
-      });
-      water.setPipeline(this.waterPipeline);
-      water.setBindGroup(0, this.frameBindGroup);
-      water.setBindGroup(1, this.heightBindGroup);
-      water.setBindGroup(2, this.skyLutBindGroup);
-      water.setBindGroup(3, this.lightBindGroup);
-      water.setVertexBuffer(0, this.waterBuffer);
-      water.draw(this.waterVertexCount);
-      water.end();
+      scene.setPipeline(this.waterPipeline);
+      scene.setVertexBuffer(0, this.waterBuffer);
+      scene.draw(this.waterVertexCount);
     }
+    // 1c. 稲（近距離の株と中距離の束。数は compute が決める → drawIndirect）
+    if (!skipRiceDraw) {
+      scene.setPipeline(this.riceNearPipeline);
+      scene.drawIndirect(this.riceArgs, 0);
+      scene.setPipeline(this.riceMidPipeline);
+      scene.drawIndirect(this.riceArgs, 16);
+    }
+    scene.end();
 
     // 2. 空（地形の無い画素だけ）
     const sky = encoder.beginRenderPass({
@@ -882,12 +1030,32 @@ export class WorldScene implements SceneRenderer {
     tonemap.end();
   }
 
+  async afterRun(): Promise<void> {
+    await this.readRiceCounts();
+  }
+
+  /** 稲のインスタンス数（直近フレーム）を読み戻す。レポート用 */
+  async readRiceCounts(): Promise<{ near: number; mid: number }> {
+    const device = this.device;
+    const read = device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.riceArgs, 0, read, 0, 32);
+    device.queue.submit([encoder.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const v = new Uint32Array(read.getMappedRange().slice(0));
+    read.unmap();
+    read.destroy();
+    this.riceCounts = { near: Math.min(v[1], RICE_MAX), mid: Math.min(v[5], RICE_MAX) };
+    return this.riceCounts;
+  }
+
   describe(): unknown {
     return {
       view: this.view,
       resolved: this.resolved,
       heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
       water: this.waterStats,
+      rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,
