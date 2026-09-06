@@ -15,12 +15,13 @@ import atmosphereWgsl from '../shaders/atmosphere.wgsl?raw';
 import skylutWgsl from '../shaders/skylut.wgsl?raw';
 import shadowWgsl from '../shaders/shadow.wgsl?raw';
 import lightsampleWgsl from '../shaders/lightsample.wgsl?raw';
+import waterWgsl from '../shaders/water.wgsl?raw';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
 import { HEIGHT, WIDTH } from '../harness/runner';
 import { multiply, perspectiveReversedInfinite, viewRotation } from '../math/mat4';
-import { cross, dirFromAzEl, normalize, type Vec3 } from '../math/vec';
+import { cross, dirFromAzEl, dot, normalize, type Vec3 } from '../math/vec';
 import type { View } from '../views';
 
 /**
@@ -50,6 +51,21 @@ const HM_TEXELS = [0.25, 1.6, 12.8] as const;
 /** 空の LUT（正距円筒）。空の描画・環境光・映り込みに使う。太陽が固定なので起動時に 1 回焼く */
 const SKY_LUT_W = 512;
 const SKY_LUT_H = 256;
+
+/** 水面メッシュに使う区画索引の範囲（盆地 |u|<484, 北 v<163, 南 v>-121 を余裕をもって覆う） */
+const CELL_I0 = -22;
+const CELL_NI = 45;
+const CELL_J0 = -9;
+const CELL_NJ = 22;
+const CELL_STRIDE = 64;
+const CELL_GRID_U = 9;
+const CELL_GRID_V = 3;
+/** 小川の帯: x の範囲と間隔、半幅（水面の半幅 2.6m より広く取り、土手の下に隠す） */
+const RIVER_X0 = -900;
+const RIVER_X1 = 900;
+const RIVER_STEP = 4;
+const RIVER_HALF = 3.2;
+const RIVER_LEVEL = -1.0;
 
 function buildRingIndices(rings: number, sectors: number): Uint32Array {
   const fan = sectors * 3;
@@ -104,10 +120,18 @@ export class WorldScene implements SceneRenderer {
   private lightTex!: GPUTexture;
   private lightBindGroup!: GPUBindGroup;
   private lightBakeMs = 0;
+  private waterPipeline!: GPURenderPipeline;
+  private waterBuffer!: GPUBuffer;
+  private waterVertexCount = 0;
+  private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
+  private queryModule!: GPUShaderModule;
+  private cameraBasis = { forward: [0, 0, 1] as Vec3, right: [1, 0, 0] as Vec3, up: [0, 1, 0] as Vec3, tanHalfFov: 0.5 };
 
   /** 起動時に GPU へ問い合わせて確定した値（レポート用） */
   private resolved = {
     eyeGroundHeight: 0,
+    /** 線に吸着した後の視点 xz */
+    eyeXZ: [0, 0] as [number, number],
     eye: [0, 0, 0] as Vec3,
     sunDir: [0, 0, 0] as Vec3,
     /** 空の放射照度（上向き面）・全天平均放射輝度・直射（太陽に正対する面）。露出の判断材料 */
@@ -133,6 +157,7 @@ export class WorldScene implements SceneRenderer {
 
     const worldCode = commonWgsl + noiseWgsl + worldWgsl;
     const queryModule = await this.makeModule('query', worldCode + queryWgsl);
+    this.queryModule = queryModule;
     const terrainModule = await this.makeModule(
       'terrain',
       worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
@@ -141,13 +166,26 @@ export class WorldScene implements SceneRenderer {
     const skyModule = await this.makeModule('sky', commonWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + skyWgsl);
     const tonemapModule = await this.makeModule('tonemap', commonWgsl + frameWgsl.replace('@group(0) @binding(0) var<uniform> frame: Frame;', '') + tonemapWgsl);
 
-    // --- 視点の地面高さを正本（world.wgsl）に問い合わせる ---
-    const eyeGround = (await this.queryHeights(queryModule, [[this.view.eye.x, this.view.eye.z]]))[0];
+    // --- 視点を線（畦・道）へ吸着し、地面高さを正本（world.wgsl）に問い合わせる ---
+    let eyeXZ: [number, number] = [this.view.eye.x, this.view.eye.z];
+    if (this.view.snap) {
+      const sn = this.view.snap;
+      const out = new Float32Array(await this.runQuery('snapQuery', [
+        { binding: 4, data: new Float32Array([sn.family, sn.index, eyeXZ[0], eyeXZ[1]]), type: 'read-only-storage' },
+        { binding: 8, data: new Float32Array([sn.offset]), type: 'read-only-storage' },
+      ], { binding: 5, byteLength: 8 }, 1));
+      eyeXZ = [out[0], out[1]];
+    }
+    this.resolved.eyeXZ = eyeXZ;
+    const eyeGround = (await this.queryHeights(queryModule, [eyeXZ]))[0];
     this.resolved.eyeGroundHeight = eyeGround;
 
     // --- 高さテクスチャを焼く（リング中心 = 視点 xz） ---
     const fwd = dirFromAzEl(this.view.yawDeg, 0);
-    const heightLayout = await this.bakeHeightmaps(heightmapModule, [this.view.eye.x, this.view.eye.z], [fwd[0] * 100, fwd[2] * 100]);
+    const heightLayout = await this.bakeHeightmaps(heightmapModule, eyeXZ, [fwd[0] * 100, fwd[2] * 100]);
+
+    // --- 水面メッシュ（区画の形と川の中心線を正本から読み戻して組む） ---
+    await this.buildWater();
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -260,6 +298,23 @@ export class WorldScene implements SceneRenderer {
       primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     });
+    const waterModule = await this.makeModule(
+      'water',
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + waterWgsl,
+    );
+    this.waterPipeline = device.createRenderPipeline({
+      label: 'water',
+      layout: frameAndHeight,
+      vertex: {
+        module: waterModule,
+        entryPoint: 'vs',
+        buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }],
+      },
+      fragment: { module: waterModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    });
+
     this.skyPipeline = device.createRenderPipeline({
       label: 'sky',
       layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout] }),
@@ -450,6 +505,148 @@ export class WorldScene implements SceneRenderer {
     return layout;
   }
 
+  /**
+   * 正本（query.wgsl）の compute を 1 回走らせて出力を読み戻す汎用の口。
+   * 入力は binding 番号ごとに与える。出力は 1 本。
+   */
+  private async runQuery(
+    entryPoint: string,
+    inputs: { binding: number; data: ArrayBufferView; type: 'uniform' | 'read-only-storage' }[],
+    output: { binding: number; byteLength: number },
+    workgroups: number,
+  ): Promise<ArrayBuffer> {
+    const device = this.device;
+    const pipeline = device.createComputePipeline({ label: entryPoint, layout: 'auto', compute: { module: this.queryModule, entryPoint } });
+    const buffers: GPUBuffer[] = [];
+    const entries: GPUBindGroupEntry[] = [];
+    for (const input of inputs) {
+      const size = Math.max(16, Math.ceil(input.data.byteLength / 16) * 16);
+      const buf = device.createBuffer({
+        size,
+        usage: (input.type === 'uniform' ? GPUBufferUsage.UNIFORM : GPUBufferUsage.STORAGE) | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(buf, 0, input.data.buffer, input.data.byteOffset, input.data.byteLength);
+      buffers.push(buf);
+      entries.push({ binding: input.binding, resource: { buffer: buf } });
+    }
+    const outSize = Math.max(16, Math.ceil(output.byteLength / 16) * 16);
+    const outBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    entries.push({ binding: output.binding, resource: { buffer: outBuf } });
+    const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroups);
+    pass.end();
+    encoder.copyBufferToBuffer(outBuf, 0, readBuf, 0, outSize);
+    device.queue.submit([encoder.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const result = readBuf.getMappedRange().slice(0, output.byteLength);
+    readBuf.unmap();
+    for (const b of buffers) b.destroy();
+    outBuf.destroy();
+    readBuf.destroy();
+    return result;
+  }
+
+  /** 区画の形（cellQuery）と川の中心線（riverQuery）から水面の三角形を組む */
+  private async buildWater(): Promise<void> {
+    const cellCount = CELL_NI * CELL_NJ;
+    const cells = new Float32Array(await this.runQuery('cellQuery', [
+      { binding: 2, data: new Int32Array([CELL_I0, CELL_J0, CELL_NI, CELL_NJ]), type: 'uniform' },
+    ], { binding: 3, byteLength: cellCount * CELL_STRIDE * 4 }, Math.ceil(cellCount / 64)));
+
+    const verts: number[] = [];
+    let paddyCells = 0;
+    for (let c = 0; c < cellCount; c++) {
+      const base = c * CELL_STRIDE;
+      if (cells[base] < 0.5) continue;
+      paddyCells++;
+      const level = cells[base + 1];
+      const pt = (sIdx: number, tIdx: number): [number, number] => {
+        const o = base + 2 + (tIdx * CELL_GRID_U + sIdx) * 2;
+        return [cells[o], cells[o + 1]];
+      };
+      for (let t = 0; t < CELL_GRID_V - 1; t++) {
+        for (let sIdx = 0; sIdx < CELL_GRID_U - 1; sIdx++) {
+          const a = pt(sIdx, t);
+          const b = pt(sIdx + 1, t);
+          const cc = pt(sIdx, t + 1);
+          const d = pt(sIdx + 1, t + 1);
+          verts.push(a[0], level, a[1], b[0], level, b[1], cc[0], level, cc[1]);
+          verts.push(b[0], level, b[1], d[0], level, d[1], cc[0], level, cc[1]);
+        }
+      }
+    }
+
+    // 小川: 中心線に沿った帯
+    const xs: number[] = [];
+    for (let x = RIVER_X0; x <= RIVER_X1; x += RIVER_STEP) xs.push(x);
+    const zs = new Float32Array(await this.runQuery('riverQuery', [
+      { binding: 6, data: new Float32Array(xs), type: 'read-only-storage' },
+    ], { binding: 7, byteLength: xs.length * 4 }, Math.ceil(xs.length / 64)));
+    const side: [number, number][][] = [];
+    for (let k = 0; k < xs.length; k++) {
+      const kp = Math.max(0, k - 1);
+      const kn = Math.min(xs.length - 1, k + 1);
+      const tx = xs[kn] - xs[kp];
+      const tz = zs[kn] - zs[kp];
+      const len = Math.hypot(tx, tz) || 1;
+      const nx = -tz / len;
+      const nz = tx / len;
+      side.push([[xs[k] + nx * RIVER_HALF, zs[k] + nz * RIVER_HALF], [xs[k] - nx * RIVER_HALF, zs[k] - nz * RIVER_HALF]]);
+    }
+    for (let k = 0; k < xs.length - 1; k++) {
+      const [l0, r0] = side[k];
+      const [l1, r1] = side[k + 1];
+      verts.push(l0[0], RIVER_LEVEL, l0[1], r0[0], RIVER_LEVEL, r0[1], l1[0], RIVER_LEVEL, l1[1]);
+      verts.push(r0[0], RIVER_LEVEL, r0[1], r1[0], RIVER_LEVEL, r1[1], l1[0], RIVER_LEVEL, l1[1]);
+    }
+
+    const data = new Float32Array(verts);
+    this.waterVertexCount = data.length / 3;
+    this.waterStats = { paddyCells, riverSamples: xs.length, triangles: this.waterVertexCount / 3 };
+    this.waterBuffer = this.device.createBuffer({
+      size: Math.max(16, data.byteLength),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    if (data.byteLength > 0) this.device.queue.writeBuffer(this.waterBuffer, 0, data);
+  }
+
+  /** 世界の方向 → 画素座標（画面外なら null） */
+  dirToPixel(dir: Vec3): { x: number; y: number } | null {
+    const { forward, right, up, tanHalfFov } = this.cameraBasis;
+    const dz = dot(dir, forward);
+    if (dz <= 1e-6) return null;
+    const ndcX = dot(dir, right) / dz / (tanHalfFov * (WIDTH / HEIGHT));
+    const ndcY = dot(dir, up) / dz / tanHalfFov;
+    return { x: ((ndcX + 1) / 2) * WIDTH, y: ((1 - ndcY) / 2) * HEIGHT };
+  }
+
+  /** 画素座標 → 世界の方向 */
+  pixelToDir(x: number, y: number): Vec3 {
+    const { forward, right, up, tanHalfFov } = this.cameraBasis;
+    const ndcX = (x / WIDTH) * 2 - 1;
+    const ndcY = 1 - (y / HEIGHT) * 2;
+    const a = ndcX * (WIDTH / HEIGHT) * tanHalfFov;
+    const b = ndcY * tanHalfFov;
+    return normalize([
+      forward[0] + right[0] * a + up[0] * b,
+      forward[1] + right[1] * a + up[1] * b,
+      forward[2] + right[2] * a + up[2] * b,
+    ]);
+  }
+
+  /** 平らな水面に映る太陽の方向（法線 +y の鏡像）と、その画素位置、地平線の画素行 */
+  predictGlint(): { reflectedDir: Vec3; pixel: { x: number; y: number } | null; horizonY: number } {
+    const s = this.resolved.sunDir;
+    const reflectedDir: Vec3 = [s[0], -s[1], s[2]];
+    const horizon = this.dirToPixel([this.cameraBasis.forward[0], 0, this.cameraBasis.forward[2]]);
+    return { reflectedDir, pixel: this.dirToPixel(reflectedDir), horizonY: horizon ? horizon.y : HEIGHT / 2 };
+  }
+
   /** world.wgsl の高さを CPU から問い合わせる（正本は WGSL のみ、という約束の実装） */
   private async queryHeights(module: GPUShaderModule, points: [number, number][]): Promise<number[]> {
     const device = this.device;
@@ -488,7 +685,7 @@ export class WorldScene implements SceneRenderer {
 
   private updateFrame(): void {
     const v = this.view;
-    const eye: Vec3 = [v.eye.x, this.resolved.eyeGroundHeight + v.eye.above, v.eye.z];
+    const eye: Vec3 = [this.resolved.eyeXZ[0], this.resolved.eyeGroundHeight + v.eye.above, this.resolved.eyeXZ[1]];
     const forward = dirFromAzEl(v.yawDeg, v.pitchDeg);
     const worldUp: Vec3 = [0, 1, 0];
     const right = normalize(cross(forward, worldUp));
@@ -499,6 +696,7 @@ export class WorldScene implements SceneRenderer {
     const sunDir = dirFromAzEl(v.sunAzimuthDeg, v.sunElevationDeg);
     this.resolved.eye = eye;
     this.resolved.sunDir = sunDir;
+    this.cameraBasis = { forward, right, up, tanHalfFov: Math.tan(fov / 2) };
 
     const f = this.frameData;
     f.set(viewProj, 0);
@@ -533,6 +731,22 @@ export class WorldScene implements SceneRenderer {
     terrain.drawIndexed(this.indexCount);
     terrain.end();
 
+    // 1b. 水面（田と小川）
+    if (this.waterVertexCount > 0) {
+      const water = encoder.beginRenderPass({
+        colorAttachments: [{ view: hdrView, loadOp: 'load', storeOp: 'store' }],
+        depthStencilAttachment: { view: depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
+      });
+      water.setPipeline(this.waterPipeline);
+      water.setBindGroup(0, this.frameBindGroup);
+      water.setBindGroup(1, this.heightBindGroup);
+      water.setBindGroup(2, this.skyLutBindGroup);
+      water.setBindGroup(3, this.lightBindGroup);
+      water.setVertexBuffer(0, this.waterBuffer);
+      water.draw(this.waterVertexCount);
+      water.end();
+    }
+
     // 2. 空（地形の無い画素だけ）
     const sky = encoder.beginRenderPass({
       colorAttachments: [{ view: hdrView, loadOp: 'load', storeOp: 'store' }],
@@ -561,6 +775,7 @@ export class WorldScene implements SceneRenderer {
       view: this.view,
       resolved: this.resolved,
       heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
+      water: this.waterStats,
       ring: {
         sectors: RING_SECTORS,
         rings: RING_COUNT,

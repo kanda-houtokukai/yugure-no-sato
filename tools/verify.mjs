@@ -17,7 +17,10 @@ const OUT_DIR = join(ROOT, '.screenshots');
 const VIEWS = ['front', 'bird', 'ground', 'water'];
 const PAGE_TIMEOUT_MS = 60000;
 
-async function captureView(browser, view, at) {
+/** 太陽の方位をずらして撮り直す幅 [度]。映り込みがこれに応じて動くことを確かめる */
+const SUN_SHIFT_DEG = 8;
+
+async function captureView(browser, view, at, extraQuery = '', suffix = '') {
   const context = await browser.newContext({
     viewport: { width: 1360, height: 900 },
     deviceScaleFactor: 1,
@@ -39,7 +42,7 @@ async function captureView(browser, view, at) {
     httpErrors.push(`failed ${req.url()} (${req.failure()?.errorText ?? '理由不明'})`);
   });
 
-  const url = `${ORIGIN}/?view=${view}`;
+  const url = `${ORIGIN}/?view=${view}${extraQuery}`;
   let report = null;
   let failure = null;
   let screenshot = null;
@@ -56,7 +59,7 @@ async function captureView(browser, view, at) {
     });
     report = await page.evaluate(() => window.__yugure.report);
 
-    screenshot = join(OUT_DIR, `${at}-${view}.png`);
+    screenshot = join(OUT_DIR, `${at}-${view}${suffix}.png`);
     await page.locator('#view').screenshot({ path: screenshot });
     sha256 = createHash('sha256').update(readFileSync(screenshot)).digest('hex');
   } catch (e) {
@@ -110,6 +113,28 @@ async function main() {
     const result = await captureView(browser, view, at);
     results.push(result);
     process.stdout.write(`  ${result.ok ? 'OK' : 'NG'}  ${result.screenshot ?? '(スクショなし)'}\n`);
+
+    // 映り込みの検証: 太陽をずらして撮り直し、明るい点が予測どおり動くか
+    if (result.report?.glint) {
+      const base = result.report.glint;
+      const shifted = await captureView(browser, view, at, `&sunAz=${275 + SUN_SHIFT_DEG}`, `-sunshift`);
+      const g = shifted.report?.glint;
+      let check = { name: `太陽を ${SUN_SHIFT_DEG}° 動かすと映り込みも動く`, ok: false, detail: '撮り直しに失敗' };
+      if (g && base.predictedPixel && g.predictedPixel) {
+        const predDx = g.predictedPixel.x - base.predictedPixel.x;
+        const obsDx = g.observedPixel.x - base.observedPixel.x;
+        const tol = Math.max(12, Math.abs(predDx) * 0.25);
+        check = {
+          name: `太陽を ${SUN_SHIFT_DEG}° 動かすと映り込みも動く`,
+          ok: Math.abs(obsDx - predDx) <= tol && g.angleDeg < 2.0,
+          detail: `予測 Δx ${predDx.toFixed(0)}px / 観測 Δx ${obsDx.toFixed(0)}px（許容 ±${tol.toFixed(0)}px）／ ずらした後のずれ ${g.angleDeg.toFixed(2)}°`,
+        };
+      }
+      result.sunShift = { screenshot: shifted.screenshot, sha256: shifted.sha256, check, glint: g ?? null };
+      result.report.checks.push(check);
+      if (!check.ok) result.ok = false;
+      process.stdout.write(`  映り込み検証 ${check.ok ? 'OK' : 'NG'}  ${check.detail}\n`);
+    }
   }
 
   const reportPath = join(OUT_DIR, `report-${at}.json`);

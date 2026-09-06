@@ -1,8 +1,8 @@
-// 焼いた法線・日向/日陰の参照（描画側）。group(3) に束ねる。rgba16float: r,g = 法線 xz、b = 太陽の可視度
+// 焼いた法線・日向/日陰の参照（描画側）。group(3) に束ねる。rgba16float: r,g = 法線 xz、b = 太陽の可視度、a = 畦・道の中心線までの距離
 
 @group(3) @binding(0) var lightTex: texture_2d_array<f32>;
 
-struct BakedLight { normal: vec3f, shadow: f32 };
+struct BakedLight { normal: vec3f, shadow: f32, ridgeDist: f32 };
 
 fn bakedLight(p: vec2f) -> BakedLight {
   let li = heightLevelFor(p);
@@ -13,5 +13,6 @@ fn bakedLight(p: vec2f) -> BakedLight {
   var out: BakedLight;
   out.normal = normalize(vec3f(t.r, y, t.g));
   out.shadow = t.b;
+  out.ridgeDist = t.a;
   return out;
 }

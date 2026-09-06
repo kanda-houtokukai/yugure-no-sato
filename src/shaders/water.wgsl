@@ -1,0 +1,95 @@
+// 水面。田の水と小川。不透明な板にせず、空の映り込み（Fresnel）と浅い水底の透け（濁り）を両立する。
+// 頂点は CPU が cellQuery / riverQuery の結果から組む（位置は世界座標、y = 水面高さ）。
+
+struct VSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) world: vec3f,
+};
+
+@vertex
+fn vs(@location(0) position: vec3f) -> VSOut {
+  var out: VSOut;
+  out.pos = frame.viewProj * vec4f(position - frame.camPos.xyz, 1.0);
+  out.world = position;
+  return out;
+}
+
+/**
+ * さざ波。風で立つ細かい波を正弦の和で。時刻は frame.params.x（固定なら絵も固定）。
+ * footprint（画素の足元 [m]）より短い波は落とす。落とさないと画素より細かい波がモアレになる（実測）
+ */
+fn rippleNormal(p: vec2f, footprint: f32) -> vec3f {
+  let t = frame.params.x;
+  var dx = 0.0;
+  var dz = 0.0;
+  let waves = array<vec4f, 4>(
+    vec4f(0.91, 0.41, 1.40, 1.9),    // 方向 xz, 波長 [m], 速度
+    vec4f(-0.35, 0.94, 0.80, 1.3),
+    vec4f(0.60, -0.80, 0.45, 0.9),
+    vec4f(-0.90, -0.44, 0.24, 0.6),
+  );
+  let amps = array<f32, 4>(0.0016, 0.0011, 0.0007, 0.0004);
+  for (var i = 0; i < 4; i++) {
+    let w = waves[i];
+    let visible = smootherstep(2.0, 8.0, w.z / footprint);
+    if (visible <= 0.0) { continue; }
+    let k = TAU / w.z;
+    let phase = dot(p, w.xy) * k + t * w.w;
+    let slope = amps[i] * k * cos(phase) * visible;
+    dx += w.x * slope;
+    dz += w.y * slope;
+  }
+  // 局所的な風のむらで波を強弱させる
+  let gust = 0.55 + 0.45 * gnoise(p / 9.0 + vec2f(t * 0.05, 0.0), 91u);
+  return normalize(vec3f(-dx * gust, 1.0, -dz * gust));
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  let toCam = frame.camPos.xyz - in.world;
+  let dist = length(toCam);
+  let v = toCam / dist;
+  let sun = frame.sunDir.xyz;
+  // 画素の足元。水面をかすめる視線では奥行き方向に伸びる
+  let footprint = dist * frame.camUp.w * 2.0 / 720.0 / max(abs(v.y), 0.05);
+  let n = rippleNormal(in.world.xz, footprint);
+
+  // ---- 映り込み ----
+  let r = reflect(-v, n);
+  let rUp = vec3f(r.x, max(r.y, 0.02), r.z);   // 水面より下は映らないので地平線へ折り返す
+  var refl = skyRadianceLut(normalize(rUp));
+  let baked = bakedLight(in.world.xz);
+  // 畦・道の線上は水ではない。遠くで畦の幾何が消えても、ここで穴を開けて区画の網目を保つ
+  if (baked.ridgeDist < 0.6) { discard; }
+  // 太陽の映り込み（円盤）。畦の影の中では消える
+  let mu = dot(normalize(rUp), sun);
+  let disc = sunDisc(mu, frame.sunDir.w);
+  if (disc > 0.0) {
+    refl += SUN_E * 40.0 * disc * (skyIrr[2].rgb / SUN_E) * baked.shadow;
+  }
+
+  // ---- 透け（浅く濁った水） ----
+  let cosTheta = clamp(dot(n, v), 0.0, 1.0);
+  let f0 = 0.02;
+  let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+  // 水底の泥は太陽と空で照らされる（法線は上向きとして）
+  let sunLight = SUN_E * (skyIrr[2].rgb / SUN_E) * max(sun.y, 0.0) * baked.shadow;
+  let ambient = skyAmbient(vec3f(0.0, 1.0, 0.0));
+  // 濡れた泥は乾いた泥より暗い
+  let mud = vec3f(0.12, 0.10, 0.07) * (sunLight + ambient);
+  // 濁り: 水中で散った光の色。深さ 0.12m の田なので泥の色が半分ほど残る
+  let murk = vec3f(0.20, 0.18, 0.11) * ambient * 0.6;
+  let depthFactor = exp(-vec3f(2.4, 2.0, 3.4) * 0.12 * 2.0 / max(cosTheta, 0.1));
+  let under = mix(murk, mud * depthFactor, 0.55);
+
+  var color = mix(under, refl, fresnel);
+
+  // 遠景の溶け込み
+  let air = atmosphereMarch(frame.camPos.xyz, -v, sun, dist, 6, 2);
+  color = color * air.transmittance + air.inscatter;
+
+  let dbg = frame.params.w;
+  if (dbg == 1.0) { color = n * 0.5 + 0.5; }
+  if (dbg == 9.0) { color = vec3f(4.0, 0.0, 4.0); }   // 診断用: 水面画素をマゼンタで塗る
+  return vec4f(color, 1.0);
+}

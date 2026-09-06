@@ -197,3 +197,56 @@ export function evaluateChecks(input: CheckInput): Check[] {
     },
   ];
 }
+
+export interface BrightRegion {
+  /** 探索した行の範囲 */
+  yMin: number;
+  maxLuminance: number;
+  /** 最大輝度の 90% 以上の画素の重心 */
+  centroid: { x: number; y: number };
+  count: number;
+}
+
+/** yMin 行より下で最も明るい領域の重心。水面の太陽の映り込み（きらめき）の位置を取るのに使う */
+export function brightestRegion(
+  bytes: Uint8Array,
+  width: number,
+  height: number,
+  bytesPerRow: number,
+  format: GPUTextureFormat,
+  yMin: number,
+): BrightRegion {
+  const bgra = format.startsWith('bgra');
+  const rOff = bgra ? 2 : 0;
+  const bOff = bgra ? 0 : 2;
+  const lum = new Float32Array(width * height);
+  let max = 0;
+  for (let y = Math.max(0, yMin | 0); y < height; y++) {
+    const row = y * bytesPerRow;
+    for (let x = 0; x < width; x++) {
+      const i = row + x * 4;
+      const l = (0.2126 * bytes[i + rOff] + 0.7152 * bytes[i + 1] + 0.0722 * bytes[i + bOff]) / 255;
+      lum[y * width + x] = l;
+      if (l > max) max = l;
+    }
+  }
+  const threshold = Math.max(max * 0.9, max - 0.03);
+  let sx = 0;
+  let sy = 0;
+  let count = 0;
+  for (let y = Math.max(0, yMin | 0); y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (lum[y * width + x] >= threshold) {
+        sx += x;
+        sy += y;
+        count++;
+      }
+    }
+  }
+  return {
+    yMin,
+    maxLuminance: max,
+    centroid: count > 0 ? { x: sx / count, y: sy / count } : { x: -1, y: -1 },
+    count,
+  };
+}

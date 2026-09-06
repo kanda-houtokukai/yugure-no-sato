@@ -186,6 +186,7 @@ struct Surface {
   kind: u32,
   t: f32,        // 盆地距離
   wet: f32,      // 0..1 濡れ（田の泥）
+  ridgeDist: f32,// 畦・道の中心線までの距離（田の外では 100）
 };
 
 fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
@@ -197,6 +198,7 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   s.t = t;
   s.wet = 0.0;
   s.kind = KIND_GROUND;
+  s.ridgeDist = 100.0;
 
   // 谷の出口: 川が西へ抜ける切れ目。ここを低くして、そこに夕日が沈むようにする
   // （盆地周りの丘 70m・山 400m は仰角 3.5° の太陽を隠してしまう。計算は台帳参照）
@@ -214,19 +216,23 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   // 畦や土手のような細い盛り上がりは、評価する足元（minWl）より細いと網目に拾われて
   // ぎざぎざになる。足元に合わせて幅を広げ、体積が変わらないよう高さを下げる。
   // 画素側は足元が小さいので本来の形で評価され、陰影は鮮明に出る。
-  // 盛り上がりがメッシュ間隔（≈ minWl/2）の 5 倍にまたがるまで広げる。高さは変えない
-  // （両側で頂の高さを一致させないと、畦の線上に段差が出て中距離で歯のように見える）
-  let widen = max(1.0, minWl * 2.5 / 0.8);
+  // 畦や土手のような細い盛り上がりは、評価する足元（minWl ≈ メッシュ間隔の 2 倍）より細いと
+  // 網目に拾われて鋸歯になる。足元に応じて幅を広げる（上限 3 倍。それ以上広げると区画の内部まで
+  // 持ち上がって水面が地形に潜る＝bird 視点で水が消えた実測）。さらに遠くでは幾何ごと消す。
+  // 遠くの畦の網目は、焼いた ridgeDist を水面が discard することで保つ。
+  let widen = clamp(minWl * 2.5 / 0.8, 1.0, 3.0);
+  let bumpScale = 1.0 - smootherstep(3.0, 6.0, minWl);
 
   if (t < 1.05) {
     let c = resolveCell(uv);
     if (c.isPaddy) {
       let mud = c.level - 0.12;
       let crest = floorH + 0.42 + 0.06 * gnoise(p / 1.5, 71u);
-      let ridge = mud + (crest - mud) * (1.0 - smootherstep(0.0, 0.8 * widen, c.ridgeDist));
+      let ridge = mud + (crest - mud) * bumpScale * (1.0 - smootherstep(0.0, 0.8 * widen, c.ridgeDist));
       h = max(mud, ridge);
       s.kind = select(KIND_RIDGE, KIND_MUD, c.ridgeDist > 0.75);
       s.wet = select(0.0, 1.0, c.ridgeDist > 0.75);
+      s.ridgeDist = c.ridgeDist;
     }
   }
 
@@ -234,11 +240,12 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   if (t < 1.3) {
     let path = nearestPath(uv, floorH);
     let hw = path.halfWidth * widen;
-    let pathH = path.top - (path.top - h) * smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist);
+    let pathH = h + (path.top - h) * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
     if (path.dist < hw + 0.7 * widen && pathH > h) {
       h = pathH;
       if (path.on) { s.kind = KIND_PATH; s.wet = 0.0; }
     }
+    s.ridgeDist = min(s.ridgeDist, path.dist);
   }
 
   // 川の掘り込み

@@ -5,6 +5,13 @@ export interface View {
   readonly name: string;
   /** 世界の xz と、その地点の地面からの高さ [m] */
   readonly eye: { x: number; z: number; above: number };
+  /**
+   * 視点を畦や道の線の上へ吸着する（線の位置は正本の WGSL にしかないので GPU に問い合わせる）。
+   * family 0 = 縦線 B（x を合わせる）、1 = 横線 A（z を合わせる）。offset は線からの横ずれ [m]
+   */
+  readonly snap?: { family: 0 | 1; index: number; offset: number };
+  /** 太陽の映り込み位置の機械検証を行う視点か */
+  readonly glintCheck?: boolean;
   /** 方位（北 = 0°, 東 = 90°）と仰角（度） */
   readonly yawDeg: number;
   readonly pitchDeg: number;
@@ -28,14 +35,14 @@ const SUN_EL = 3.5;
 const base = { time: 0, sunAzimuthDeg: SUN_AZ, sunElevationDeg: SUN_EL, exposure: 0.45, debug: 0 };
 
 export const VIEWS: Readonly<Record<string, View>> = {
-  // 集落側（南）のあぜ道に立ち、田を越えて神社の丘（北）を望む
-  front: { name: 'front', eye: { x: 0, z: -135, above: 1.6 }, yawDeg: -8, pitchDeg: 2, fovDeg: 55, ...base },
+  // 集落側（南）の主道に立ち、田を越えて神社の丘（北）を望む
+  front: { name: 'front', eye: { x: 0, z: -135, above: 1.6 }, snap: { family: 0, index: 0, offset: 0 }, yawDeg: -8, pitchDeg: 2, fovDeg: 55, ...base },
   // 谷の南の上空から盆地全体を見下ろす
   bird: { name: 'bird', eye: { x: -80, z: -330, above: 75 }, yawDeg: 14, pitchDeg: -20, fovDeg: 50, ...base },
   // 主道の上、地面すれすれから北へ
-  ground: { name: 'ground', eye: { x: 0.9, z: -70, above: 0.12 }, yawDeg: 0, pitchDeg: 1, fovDeg: 65, ...base },
-  // 畦にしゃがみ、夕日の方向へ田の水面を見る（水面の見せ場）
-  water: { name: 'water', eye: { x: -32, z: 22, above: 0.9 }, yawDeg: 272, pitchDeg: -3, fovDeg: 55, ...base },
+  ground: { name: 'ground', eye: { x: 0.9, z: -70, above: 0.12 }, snap: { family: 0, index: 0, offset: 0.3 }, yawDeg: 0, pitchDeg: 1, fovDeg: 65, ...base },
+  // 畦（縦線 -1）の上にしゃがみ、夕日の方向へ田の水面を見る（水面の見せ場）
+  water: { name: 'water', eye: { x: -26, z: 22, above: 0.9 }, snap: { family: 0, index: -1, offset: 0 }, glintCheck: true, yawDeg: 272, pitchDeg: -3, fovDeg: 55, ...base },
 };
 
 export const VIEW_NAMES = Object.keys(VIEWS);
@@ -61,6 +68,8 @@ export function viewFromUrl(search: string): View {
   return {
     name: q.get('view') ?? b.name,
     eye,
+    ...(b.snap && !eyeRaw ? { snap: b.snap } : {}),
+    ...(b.glintCheck ? { glintCheck: true } : {}),
     yawDeg: num(q, 'yaw', b.yawDeg),
     pitchDeg: num(q, 'pitch', b.pitchDeg),
     fovDeg: num(q, 'fov', b.fovDeg),
