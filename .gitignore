@@ -1,0 +1,7 @@
+node_modules/
+dist/
+
+# 自己修正ループが吐く一時成果物（フェーズ0で使用）
+.screenshots/
+*.log
+.DS_Store
