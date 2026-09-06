@@ -32,9 +32,12 @@ export class Walker {
   private lastDirX = 0;
   private lastDirZ = 1;
 
-  static readonly WALK_SPEED = 1.4;   // m/s
-  static readonly RUN_SPEED = 3.2;
-  static readonly STEP_LENGTH = 0.65; // 足跡の間隔 [m]
+  // 実寸（歩き 1.4m/s）だと画面では遅く感じる。体感に合わせて上げた（2026-09-07）
+  static readonly WALK_SPEED = 2.2;   // m/s
+  static readonly RUN_SPEED = 5.0;
+  /** 歩幅。速いほど広い（走りで足跡が刻まれすぎないように） */
+  static readonly STEP_WALK = 0.85;
+  static readonly STEP_RUN = 1.25;
   static readonly CAMERA_DIST = 3.0;
   static readonly PIVOT_HEIGHT = 1.2;
 
@@ -52,13 +55,14 @@ export class Walker {
     if (len > 1e-6) {
       mx /= len; mz /= len;
       const speed = input.run ? Walker.RUN_SPEED : Walker.WALK_SPEED;
+      const stride = input.run ? Walker.STEP_RUN : Walker.STEP_WALK;
       const dist = speed * dt;
       this.x += mx * dist;
       this.z += mz * dist;
       this.lastDirX = mx; this.lastDirZ = mz;
       this.stepAccum += dist;
-      while (this.stepAccum >= Walker.STEP_LENGTH) {
-        this.stepAccum -= Walker.STEP_LENGTH;
+      while (this.stepAccum >= stride) {
+        this.stepAccum -= stride;
         this.stepSide = -this.stepSide;
         // 進行方向に対して左右へ 0.12m
         const sx = -mz * this.stepSide * 0.12;
@@ -100,11 +104,12 @@ export class Walker {
 export function scriptInput(name: string, frame: number): WalkerInput {
   const on = (f: number): WalkerInput => ({ ...IDLE_INPUT, forward: f });
   switch (name) {
+    // 歩く速さを 1.4 → 2.2 m/s に上げたので、同じ経路をたどるよう秒数を 0.64 倍にした
     case 'walk1': {
-      if (frame < 180) return on(1);
-      if (frame < 240) return { ...IDLE_INPUT, forward: 1, yawDelta: 90 / 60 };   // 1 秒で 90° 右へ
-      if (frame < 420) return on(1);
-      if (frame < 480) return { ...IDLE_INPUT, forward: 0.4, yawDelta: 180 / 60, pitchDelta: 30 / 60 };  // 1 秒で振り返り、カメラを 30° 上げる
+      if (frame < 115) return on(1);                                              // 道を北へ 4.2m
+      if (frame < 175) return { ...IDLE_INPUT, forward: 1, yawDelta: 90 / 60 };   // 1 秒で 90° 右へ
+      if (frame < 290) return on(1);                                              // 田を東へ 4.2m
+      if (frame < 350) return { ...IDLE_INPUT, forward: 0.4, yawDelta: 180 / 60, pitchDelta: 30 / 60 };  // 振り返り、カメラを 30° 上げる
       return IDLE_INPUT;
     }
     default:
