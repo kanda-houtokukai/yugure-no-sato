@@ -1,6 +1,7 @@
 import { probeWebGPU } from './gpu/probe';
 import { postToSink } from './sink';
 import { runScene } from './harness/runner';
+import { runPlay } from './harness/play';
 import { WorldScene } from './scene/world';
 import { viewFromUrl } from './views';
 import { brightestRegion, evaluateChecks, type Check } from './selfcheck';
@@ -29,7 +30,9 @@ declare global {
   interface Window {
     /** 検証ハーネスが待ち受ける旗と結果。ここ以外の経路でページの状態を判定しない */
     __yugure: {
-      mode: 'probe' | 'scene';
+      mode: 'probe' | 'scene' | 'play';
+      /** 実操作モードの計測値（play.ts） */
+      play?: unknown;
       probeDone: boolean;
       probe: unknown;
       /** 最初のフレームが GPU 側で描き終わった。スクショはこれ以降でないと真っ黒を撮る */
@@ -42,7 +45,8 @@ declare global {
 }
 
 const params = new URLSearchParams(location.search);
-const mode = params.get('mode') === 'probe' ? 'probe' : 'scene';
+const modeRaw = params.get('mode');
+const mode = modeRaw === 'probe' ? 'probe' : modeRaw === 'play' ? 'play' : 'scene';
 
 window.__yugure = { mode, probeDone: false, probe: null, firstFrameDone: false, sceneDone: false, report: null };
 
@@ -141,4 +145,12 @@ async function runView(): Promise<void> {
   window.__yugure.sceneDone = true;
 }
 
-void (mode === 'probe' ? runProbe() : runView());
+async function runLive(): Promise<void> {
+  const view = viewFromUrl(location.search);
+  const canvas = document.getElementById('view');
+  if (!(canvas instanceof HTMLCanvasElement)) throw new Error('#view キャンバスが無い');
+  status('起動中…');
+  await runPlay(canvas, new WorldScene(view), status);
+}
+
+void (mode === 'probe' ? runProbe() : mode === 'play' ? runLive() : runView());

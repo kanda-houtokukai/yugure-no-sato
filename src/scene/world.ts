@@ -210,7 +210,8 @@ export class WorldScene implements SceneRenderer {
   private frameIndex = 0;
   /** 歩き手（変形を起こす主体）。筋書きまたは実操作で動く */
   readonly walker = new Walker();
-  /** 実操作モードが毎フレーム差し込む入力 */
+  /** 実操作モード（play.ts）が true にし、毎フレーム liveInput を差し込む */
+  live = false;
   liveInput: WalkerInput = { ...IDLE_INPUT };
   /** 描画に使うカメラ。静止視点なら view から、歩行なら歩き手から */
   private camera = { eye: [0, 0, 0] as Vec3, forward: [0, 0, 1] as Vec3 };
@@ -1350,9 +1351,10 @@ export class WorldScene implements SceneRenderer {
     const { encoder } = ctx;
     this.frameIndex = ctx.frameIndex;
     // 歩き手: 筋書きか実操作で 1 歩進め、足跡と通り跡を予約する
-    const walking = this.view.script !== undefined || this.view.debug === 21;
+    const walking = this.view.script !== undefined || this.live;
     if (walking) {
-      const input = this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : this.liveInput;
+      // 実操作モードでは筋書きより実操作を優先する
+      const input = this.live ? this.liveInput : this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : IDLE_INPUT;
       const falls = this.walker.step(input, FIXED_DT, this.groundHeight);
       for (const f of falls) {
         if (this.footfallLog.length < 400) this.footfallLog.push({ f: ctx.frameIndex, x: f.x, z: f.z, side: f.side });

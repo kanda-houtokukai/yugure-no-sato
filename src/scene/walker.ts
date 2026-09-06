@@ -104,7 +104,7 @@ export function scriptInput(name: string, frame: number): WalkerInput {
       if (frame < 180) return on(1);
       if (frame < 240) return { ...IDLE_INPUT, forward: 1, yawDelta: 90 / 60 };   // 1 秒で 90° 右へ
       if (frame < 420) return on(1);
-      if (frame < 480) return { ...IDLE_INPUT, forward: 0.4, yawDelta: 180 / 60 };  // 1 秒で振り返る
+      if (frame < 480) return { ...IDLE_INPUT, forward: 0.4, yawDelta: 180 / 60, pitchDelta: 30 / 60 };  // 1 秒で振り返り、カメラを 30° 上げる
       return IDLE_INPUT;
     }
     default:
