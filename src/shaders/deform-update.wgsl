@@ -19,8 +19,8 @@ struct Stamp {
 @group(3) @binding(0) var updMat: texture_2d_array<f32>;
 @group(3) @binding(1) var updDeformIn: texture_2d<f32>;
 @group(3) @binding(2) var updRippleIn: texture_2d<f32>;
-@group(3) @binding(3) var updDeformOut: texture_storage_2d<rgba16float, write>;
-@group(3) @binding(4) var updRippleOut: texture_storage_2d<rgba16float, write>;
+@group(3) @binding(3) var updDeformOut: texture_storage_2d<rgba32float, write>;
+@group(3) @binding(4) var updRippleOut: texture_storage_2d<rgba32float, write>;
 @group(3) @binding(5) var<storage, read> stamps: array<Stamp, 32>;
 @group(3) @binding(6) var<uniform> dp: DeformParams;
 

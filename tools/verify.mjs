@@ -14,7 +14,7 @@ import { ROOT, startVite, stamp, waitForServer } from './dev-server.mjs';
 const PORT = 5198;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const OUT_DIR = join(ROOT, '.screenshots');
-const VIEWS = ['front', 'bird', 'ground', 'water'];
+const VIEWS = ['front', 'bird', 'ground', 'water', 'walk'];
 const PAGE_TIMEOUT_MS = 60000;
 
 /** 太陽の方位をずらして撮り直す幅 [度]。映り込みがこれに応じて動くことを確かめる */

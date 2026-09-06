@@ -16,9 +16,10 @@ export const resolution = { width: CSS_WIDTH, height: CSS_HEIGHT, dpr: 1 };
 function bytesPerRowFor(width: number): number {
   return Math.ceil((width * 4) / 256) * 256;
 }
-const FRAME_COUNT = 120;
 const MEASURE_TAIL = 60;
-const LOOP_TIMEOUT_MS = 30000;
+/** タイムスタンプを取る末尾のフレーム数（QuerySet の上限に収める） */
+const TS_FRAMES = 120;
+const LOOP_TIMEOUT_MS = 90000;
 
 export interface ShaderMessage {
   module: string;
@@ -73,7 +74,10 @@ export async function runScene(
   canvas: HTMLCanvasElement,
   scene: SceneRenderer,
   onFirstFrame: () => void,
+  frameCount = 120,
 ): Promise<RunResult> {
+  const FRAME_COUNT = frameCount;
+  const tsStart = Math.max(0, FRAME_COUNT - TS_FRAMES);
   // Retina では CSS 1px = 物理 2px。描画をこれに合わせないと半分の解像度で描いて引き伸ばすことになる
   // （フェーズ2で実測: 実ディスプレイ DPR 2、キャンバス 1280×720 が物理 2560×1440 を覆っていた）
   const override = Number(new URLSearchParams(location.search).get('dpr'));
@@ -109,7 +113,7 @@ export async function runScene(
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
 
-  const queryCount = FRAME_COUNT * 2;
+  const queryCount = TS_FRAMES * 2;
   const tsBytes = queryCount * 8;
   const querySet = hasTimestampQuery ? device.createQuerySet({ type: 'timestamp', count: queryCount }) : null;
   const tsResolve = querySet
@@ -122,12 +126,13 @@ export async function runScene(
   function renderFrame(index: number, isLast: boolean): void {
     const encoder = device.createCommandEncoder();
     const texture = context!.getCurrentTexture();
+    const ti = index - tsStart;
     scene.render({
       encoder,
       target: texture.createView(),
       frameIndex: index,
-      tsBegin: querySet ? { querySet, beginningOfPassWriteIndex: index * 2 } : undefined,
-      tsEnd: querySet ? { querySet, endOfPassWriteIndex: index * 2 + 1 } : undefined,
+      tsBegin: querySet && ti >= 0 ? { querySet, beginningOfPassWriteIndex: ti * 2 } : undefined,
+      tsEnd: querySet && ti >= 0 ? { querySet, endOfPassWriteIndex: ti * 2 + 1 } : undefined,
     });
     if (isLast) {
       encoder.copyTextureToBuffer(
@@ -179,7 +184,8 @@ export async function runScene(
     const stamps = new BigUint64Array(tsReadback.getMappedRange().slice(0));
     tsReadback.unmap();
     const deltas: bigint[] = [];
-    for (let i = Math.max(0, framesRendered - MEASURE_TAIL); i < framesRendered; i++) {
+    const measured = Math.min(framesRendered, TS_FRAMES);
+    for (let i = Math.max(0, measured - MEASURE_TAIL); i < measured; i++) {
       const a = stamps[i * 2];
       const b = stamps[i * 2 + 1];
       if ((a === 0n && b === 0n) || b <= a) continue;

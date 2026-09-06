@@ -84,7 +84,7 @@ async function runView(): Promise<void> {
     }
     const result = await runScene(canvas, scene, () => {
       window.__yugure.firstFrameDone = true;
-    });
+    }, view.frames ?? 120);
     const checks = evaluateChecks({
       image: result.image,
       gpuErrors: result.gpuErrors,

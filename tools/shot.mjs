@@ -41,6 +41,7 @@ if (s) {
   if (s.gpuErrors?.length) console.log('GPUエラー:', JSON.stringify(s.gpuErrors));
   if (s.scene?.resolved) console.log('resolved:', JSON.stringify(s.scene.resolved));
   if (s.scene?.extra) console.log('extra:', JSON.stringify(s.scene.extra));
+  if (s.scene?.probe?.length) for (const p of s.scene.probe) console.log('probe:', JSON.stringify(p));
 }
 console.log(`→ ${path}`);
 process.exit(0);

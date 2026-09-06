@@ -12,6 +12,10 @@ export interface View {
   readonly snap?: { family: 0 | 1; index: number; offset: number };
   /** 太陽の映り込み位置の機械検証を行う視点か */
   readonly glintCheck?: boolean;
+  /** 歩き手の筋書き名（walker.ts の scriptInput）。指定すると三人称カメラで歩く */
+  readonly script?: string;
+  /** 描画フレーム数（既定 120）。筋書きの長さに合わせる */
+  readonly frames?: number;
   /** 方位（北 = 0°, 東 = 90°）と仰角（度） */
   readonly yawDeg: number;
   readonly pitchDeg: number;
@@ -42,6 +46,8 @@ export const VIEWS: Readonly<Record<string, View>> = {
   // 主道の上、地面すれすれから北へ
   ground: { name: 'ground', eye: { x: 0.9, z: -70, above: 0.12 }, snap: { family: 0, index: 0, offset: 0.3 }, yawDeg: 0, pitchDeg: 1, fovDeg: 65, ...base },
   // 畦（縦線 -1）の上にしゃがみ、夕日の方向へ田の水面を見る（水面の見せ場）
+  // 歩き手の筋書き（道 → 田 → 畦 → 振り返る）。跡が田・道・草地に残る画
+  walk: { name: 'walk', eye: { x: 0, z: -119, above: 0 }, snap: { family: 0, index: 0, offset: 0 }, script: 'walk1', frames: 540, yawDeg: 0, pitchDeg: 0, fovDeg: 55, ...base },
   // 風が田を渡る様子を見る専用視点（verify の 4 視点には含めない）: 主道の上 2.5m から西の田を逆光で見渡す
   wind: { name: 'wind', eye: { x: 0, z: -40, above: 2.5 }, snap: { family: 0, index: 0, offset: 0 }, yawDeg: 290, pitchDeg: -6, fovDeg: 60, ...base },
   water: { name: 'water', eye: { x: -26, z: 22, above: 0.9 }, snap: { family: 0, index: -1, offset: 0 }, glintCheck: true, yawDeg: 272, pitchDeg: -3, fovDeg: 55, ...base },
@@ -72,6 +78,8 @@ export function viewFromUrl(search: string): View {
     eye,
     ...(b.snap && !eyeRaw ? { snap: b.snap } : {}),
     ...(b.glintCheck ? { glintCheck: true } : {}),
+    ...(q.get('script') ?? b.script ? { script: q.get('script') ?? b.script } : {}),
+    frames: num(q, 'frames', b.frames ?? 120),
     yawDeg: num(q, 'yaw', b.yawDeg),
     pitchDeg: num(q, 'pitch', b.pitchDeg),
     fovDeg: num(q, 'fov', b.fovDeg),

@@ -24,6 +24,7 @@ import deformWgsl from '../shaders/deform.wgsl?raw';
 import deformUpdateWgsl from '../shaders/deform-update.wgsl?raw';
 import deformQueryWgsl from '../shaders/deform-query.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
+import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
@@ -198,6 +199,8 @@ export class WorldScene implements SceneRenderer {
   private deformQueryPipeline!: GPUComputePipeline;
   private probePoints: [number, number][] = [];
   private probeResults: { x: number; z: number; sink: number; bendX: number; bendZ: number; bend: number; turbidity: number; ripple: number; inside: boolean }[] = [];
+  /** 足跡を打った座標の記録（検証用。先頭 400 件） */
+  private footfallLog: { f: number; x: number; z: number; side: number }[] = [];
   private skyLutBindGroups: GPUBindGroup[] = [];
   private deformParams!: GPUBuffer;
   private stampBuffer!: GPUBuffer;
@@ -205,8 +208,14 @@ export class WorldScene implements SceneRenderer {
   private deformOrigin: [number, number] = [0, 0];
   private deformPrevOrigin: [number, number] = [0, 0];
   private frameIndex = 0;
-  /** 歩き手の位置（変形を起こす主体）。段階2で移動が入るまでは視点の足元 */
-  walker = { x: 0, z: 0, yawDeg: 0 };
+  /** 歩き手（変形を起こす主体）。筋書きまたは実操作で動く */
+  readonly walker = new Walker();
+  /** 実操作モードが毎フレーム差し込む入力 */
+  liveInput: WalkerInput = { ...IDLE_INPUT };
+  /** 描画に使うカメラ。静止視点なら view から、歩行なら歩き手から */
+  private camera = { eye: [0, 0, 0] as Vec3, forward: [0, 0, 1] as Vec3 };
+  /** 近景段の高さテクスチャの CPU 複製（足元の高さ用。毎フレームの GPU 同期を避ける） */
+  private l0: { origin: [number, number]; texel: number; size: number; data: Float32Array } | null = null;
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -290,6 +299,11 @@ export class WorldScene implements SceneRenderer {
       size: FRAME_FLOATS * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this.camera = { eye: [eyeXZ[0], eyeGround + this.view.eye.above, eyeXZ[1]], forward: dirFromAzEl(this.view.yawDeg, this.view.pitchDeg) };
+    // 歩き手の初期位置は視点の足元
+    this.walker.x = eyeXZ[0];
+    this.walker.z = eyeXZ[1];
+    this.walker.yawDeg = this.view.yawDeg;
     this.updateFrame();
 
     // --- 描画先 ---
@@ -464,9 +478,11 @@ export class WorldScene implements SceneRenderer {
       ],
     });
     // 変形の場（ping-pong の 2 組）
+    // rgba32float: f16 だと 1 フレームの減衰量（数万分の一）が量子化幅を下回り、遅い戻り（τ=240s）が
+    // 実測で 10 倍速く戻った。32bit なら問題ない（float32-filterable で線形補間も可）。2 組 × 2 枚で 64MB
     for (let i = 0; i < 2; i++) {
-      this.deformTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
-      this.rippleTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
+      this.deformTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba32float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
+      this.rippleTex.push(device.createTexture({ size: [DEFORM_SIZE, DEFORM_SIZE], format: 'rgba32float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }));
     }
     const deformSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' });
     const skySampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
@@ -521,8 +537,8 @@ export class WorldScene implements SceneRenderer {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba32float', access: 'write-only' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba32float', access: 'write-only' } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       ],
@@ -765,7 +781,8 @@ export class WorldScene implements SceneRenderer {
     this.heightTex = device.createTexture({
       size: [HM_SIZE, HM_SIZE, HM_TEXELS.length],
       format: 'r32float',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+      // COPY_SRC: 近景段を CPU に読み戻す（歩き手の足元）
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
     const pipeline = device.createComputePipeline({
@@ -805,10 +822,22 @@ export class WorldScene implements SceneRenderer {
       pass.dispatchWorkgroups(HM_SIZE / 8, HM_SIZE / 8);
       pass.end();
     });
+    // 近景段（L0）を CPU に読み戻す（歩き手の足元の高さ用）。2048² × 4B = 16MB、1 回きり
+    const l0Bytes = HM_SIZE * HM_SIZE * 4;
+    const l0Read = device.createBuffer({ size: l0Bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    encoder.copyTextureToBuffer(
+      { texture: this.heightTex, origin: [0, 0, 0] },
+      { buffer: l0Read, bytesPerRow: HM_SIZE * 4, rowsPerImage: HM_SIZE },
+      { width: HM_SIZE, height: HM_SIZE, depthOrArrayLayers: 1 },
+    );
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
     this.heightBakeMs = performance.now() - t0;
     for (const b of scratch) b.destroy();
+    await l0Read.mapAsync(GPUMapMode.READ);
+    this.l0 = { origin: [levelParams[0], levelParams[1]], texel: levelParams[2], size: HM_SIZE, data: new Float32Array(l0Read.getMappedRange().slice(0)) };
+    l0Read.unmap();
+    l0Read.destroy();
 
     const levelsBuf = device.createBuffer({ size: levelParams.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(levelsBuf, 0, levelParams);
@@ -1169,8 +1198,8 @@ export class WorldScene implements SceneRenderer {
 
   private updateFrame(): void {
     const v = this.view;
-    const eye: Vec3 = [this.resolved.eyeXZ[0], this.resolved.eyeGroundHeight + v.eye.above, this.resolved.eyeXZ[1]];
-    const forward = dirFromAzEl(v.yawDeg, v.pitchDeg);
+    const eye: Vec3 = this.camera.eye;
+    const forward: Vec3 = this.camera.forward;
     const worldUp: Vec3 = [0, 1, 0];
     const right = normalize(cross(forward, worldUp));
     const up = cross(right, forward);
@@ -1201,6 +1230,20 @@ export class WorldScene implements SceneRenderer {
     f.set([this.deformOrigin[0], this.deformOrigin[1], DEFORM_TEXEL, DEFORM_SIZE], 52);
     this.device.queue.writeBuffer(this.frameBuffer, 0, f);
   }
+
+  /** 足元の高さ（近景段の CPU 複製を双線形で読む）。段の外なら視点の地面高さで代用 */
+  groundHeight = (x: number, z: number): number => {
+    const l = this.l0;
+    if (!l) return this.resolved.eyeGroundHeight;
+    const fx = (x - l.origin[0]) / l.texel - 0.5;
+    const fz = (z - l.origin[1]) / l.texel - 0.5;
+    const ix = Math.floor(fx), iz = Math.floor(fz);
+    if (ix < 0 || iz < 0 || ix >= l.size - 1 || iz >= l.size - 1) return this.resolved.eyeGroundHeight;
+    const tx = fx - ix, tz = fz - iz;
+    const d = l.data, n = l.size;
+    const h00 = d[iz * n + ix], h10 = d[iz * n + ix + 1], h01 = d[(iz + 1) * n + ix], h11 = d[(iz + 1) * n + ix + 1];
+    return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
+  };
 
   /** 変形の場を世界座標で読み戻す（検証用）。現在の ping 側を読む */
   async probeDeform(points: [number, number][]): Promise<typeof this.probeResults> {
@@ -1306,7 +1349,20 @@ export class WorldScene implements SceneRenderer {
   render(ctx: FrameContext): void {
     const { encoder } = ctx;
     this.frameIndex = ctx.frameIndex;
-    if (ctx.frameIndex === 0) this.walker = { x: this.resolved.eyeXZ[0], z: this.resolved.eyeXZ[1], yawDeg: this.view.yawDeg };
+    // 歩き手: 筋書きか実操作で 1 歩進め、足跡と通り跡を予約する
+    const walking = this.view.script !== undefined || this.view.debug === 21;
+    if (walking) {
+      const input = this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : this.liveInput;
+      const falls = this.walker.step(input, FIXED_DT, this.groundHeight);
+      for (const f of falls) {
+        if (this.footfallLog.length < 400) this.footfallLog.push({ f: ctx.frameIndex, x: f.x, z: f.z, side: f.side });
+        this.addStamp(f.x, f.z, 0.15, 0, f.dirX, f.dirZ, 0.12, 0.9);
+        // 体が通った跡（倒すだけ）
+        this.addStamp(this.walker.x, this.walker.z, 0.42, 1, f.dirX, f.dirZ, 0, 0.85);
+      }
+      const cam = this.walker.camera(this.groundHeight);
+      this.camera = { eye: cam.eye, forward: cam.forward };
+    }
     // 変形の場を進めてから、フレーム定数（時刻・窓の原点）を書く
     this.stepDeform(encoder);
     this.updateFrame();
@@ -1453,6 +1509,8 @@ export class WorldScene implements SceneRenderer {
       trees: this.treeStats,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
+      walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
+      footfalls: this.footfallLog,
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,
