@@ -51,7 +51,7 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let v = toCam / dist;
   let sun = frame.sunDir.xyz;
   // 画素の足元。水面をかすめる視線では奥行き方向に伸びる
-  let footprint = dist * frame.camUp.w * 2.0 / 720.0 / max(abs(v.y), 0.05);
+  let footprint = dist * frame.camUp.w * 2.0 / frame.center.w / max(abs(v.y), 0.05);
   let n = rippleNormal(in.world.xz, footprint);
 
   // ---- 映り込み ----
@@ -73,7 +73,7 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let f0 = 0.02;
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
   // 水底の泥は太陽と空で照らされる（法線は上向きとして）
-  let sunLight = SUN_E * (skyIrr[2].rgb / SUN_E) * max(sun.y, 0.0) * baked.shadow;
+  let sunLight = sunLightAt(in.world.y) * max(sun.y, 0.0) * baked.shadow;
   let ambient = skyAmbient(vec3f(0.0, 1.0, 0.0));
   // 濡れた泥は乾いた泥より暗い
   let mud = vec3f(0.12, 0.10, 0.07) * (sunLight + ambient);
@@ -84,8 +84,8 @@ fn fs(in: VSOut) -> @location(0) vec4f {
 
   var color = mix(under, refl, fresnel);
 
-  // 遠景の溶け込み
-  let air = atmosphereMarch(frame.camPos.xyz, -v, sun, dist, 6, 2);
+  // 遠景の溶け込み（3D LUT）
+  let air = aerialLut(-v, dist);
   color = color * air.transmittance + air.inscatter;
 
   let dbg = frame.params.w;

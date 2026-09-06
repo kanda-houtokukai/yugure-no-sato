@@ -1,6 +1,6 @@
 import { probeWebGPU } from './gpu/probe';
 import { postToSink } from './sink';
-import { HEIGHT, WIDTH, runScene } from './harness/runner';
+import { runScene } from './harness/runner';
 import { WorldScene } from './scene/world';
 import { viewFromUrl } from './views';
 import { brightestRegion, evaluateChecks, type Check } from './selfcheck';
@@ -88,7 +88,7 @@ async function runView(): Promise<void> {
     let glint: GlintReport | null = null;
     if (view.glintCheck) {
       const pred = scene.predictGlint();
-      const region = brightestRegion(result.pixels, WIDTH, HEIGHT, result.bytesPerRow, result.canvas.format, pred.horizonY + 12);
+      const region = brightestRegion(result.pixels, result.canvas.width, result.canvas.height, result.bytesPerRow, result.canvas.format, pred.horizonY + 12 * result.canvas.dpr);
       const observedDir = scene.pixelToDir(region.centroid.x, region.centroid.y);
       const angleDeg = (Math.acos(Math.max(-1, Math.min(1, dot(observedDir, pred.reflectedDir)))) * 180) / Math.PI;
       glint = {

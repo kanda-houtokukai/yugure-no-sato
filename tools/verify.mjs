@@ -23,7 +23,7 @@ const SUN_SHIFT_DEG = 8;
 async function captureView(browser, view, at, extraQuery = '', suffix = '') {
   const context = await browser.newContext({
     viewport: { width: 1360, height: 900 },
-    deviceScaleFactor: 1,
+    deviceScaleFactor: 2  /* 実機は Retina（DPR 2）。スクショも物理解像度 2560×1440 で撮る */,
   });
   const page = await context.newPage();
 

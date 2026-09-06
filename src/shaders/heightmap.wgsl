@@ -30,6 +30,8 @@ fn fillLevel(@builtin(global_invocation_id) id: vec3u) {
 // rg16float / r8unorm は storage 書き込み非対応（検証エラーで判明）。rgba16float 1 枚に
 // 法線 xz と太陽の可視度をまとめる
 @group(2) @binding(1) var outLight: texture_storage_2d_array<rgba16float, write>;
+// 材質: rgb = アルベド, a = 種別/8。画素ごとの数式評価（DPR2 で 24ms）をなくす
+@group(2) @binding(2) var outMaterial: texture_storage_2d_array<rgba8unorm, write>;
 
 @compute @workgroup_size(8, 8)
 fn bakeNormalShadow(@builtin(global_invocation_id) id: vec3u) {
@@ -43,4 +45,5 @@ fn bakeNormalShadow(@builtin(global_invocation_id) id: vec3u) {
   // a = 畦・道の中心線までの距離。水面がその線上を discard して、遠くでも区画の網目を保つ
   let surf = terrainSurface(p, lv.z * 2.0);
   textureStore(outLight, vec2i(id.xy), i32(bakeLayer), vec4f(nrm.x, nrm.z, shade, min(surf.ridgeDist, 50.0)));
+  textureStore(outMaterial, vec2i(id.xy), i32(bakeLayer), vec4f(terrainAlbedo(p, surf), f32(surf.kind) / 8.0));
 }

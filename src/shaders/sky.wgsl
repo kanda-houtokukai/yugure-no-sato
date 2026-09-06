@@ -91,3 +91,30 @@ fn reduceSkyLut(@builtin(local_invocation_id) lid: vec3u) {
     skyIrrOut[2] = vec4f(SUN_E * sunTransmittance(toPlanet(frame.camPos.xyz), frame.sunDir.xyz, 8), 0.0);
   }
 }
+
+// ---- 遠景 LUT と太陽光 LUT の焼き込み ----
+@group(0) @binding(4) var aerialInOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var aerialTrOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(6) var<storage, read_write> sunLutOut: array<vec4f, 128>;
+
+@compute @workgroup_size(4, 4, 4)
+fn bakeAerial(@builtin(global_invocation_id) id: vec3u) {
+  let size = textureDimensions(aerialInOut);
+  if (id.x >= size.x || id.y >= size.y || id.z >= size.z) { return; }
+  let az = ((f32(id.x) + 0.5) / f32(size.x) - 0.5) * TAU;
+  let el = AERIAL_EL_MIN + (f32(id.y) + 0.5) / f32(size.y) * (AERIAL_EL_MAX - AERIAL_EL_MIN);
+  let dist = AERIAL_D_MIN * exp((f32(id.z) + 0.5) / f32(size.z) * log(AERIAL_D_MAX / AERIAL_D_MIN));
+  let dir = vec3f(sin(az) * cos(el), sin(el), cos(az) * cos(el));
+  // 地面を突き抜けないよう、下向きの視線でも大気の積分は距離で打ち切る（地形が距離を渡す）
+  let a = atmosphereMarch(frame.camPos.xyz, dir, frame.sunDir.xyz, dist, 12, 3);
+  textureStore(aerialInOut, vec3i(id), vec4f(a.inscatter, 1.0));
+  textureStore(aerialTrOut, vec3i(id), vec4f(a.transmittance, 1.0));
+}
+
+@compute @workgroup_size(64)
+fn bakeSunLut(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= 128u) { return; }
+  let h = f32(id.x) / 127.0 * 2000.0;
+  let t = sunTransmittance(toPlanet(vec3f(frame.camPos.x, h, frame.camPos.z)), frame.sunDir.xyz, 12);
+  sunLutOut[id.x] = vec4f(SUN_E * t, 0.0);
+}

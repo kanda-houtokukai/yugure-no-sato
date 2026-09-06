@@ -4,10 +4,18 @@
 import { acquireDevice, popErrorScopes, pushErrorScopes, type DeviceBundle, type GpuErrorRecord } from '../gpu/device';
 import { analyzePixels, detectQuantumNs, summarizeMs, type FrameTimeStats, type ImageStats } from '../selfcheck';
 
-export const WIDTH = 1280;
-export const HEIGHT = 720;
-/** copyTextureToBuffer の bytesPerRow は 256 の倍数でなければならない。1280*4 = 5120 は条件を満たす */
-const BYTES_PER_ROW = WIDTH * 4;
+/** キャンバスの CSS サイズ。実描画解像度はこれに devicePixelRatio（上限 2）を掛ける */
+export const CSS_WIDTH = 1280;
+export const CSS_HEIGHT = 720;
+export const MAX_DPR = 2;
+
+/** 現在の実描画解像度。init 時に決まる（Retina なら 2560×1440） */
+export const resolution = { width: CSS_WIDTH, height: CSS_HEIGHT, dpr: 1 };
+
+/** copyTextureToBuffer の bytesPerRow は 256 の倍数。1280*4 と 2560*4 はいずれも条件を満たす */
+function bytesPerRowFor(width: number): number {
+  return Math.ceil((width * 4) / 256) * 256;
+}
 const FRAME_COUNT = 120;
 const MEASURE_TAIL = 60;
 const LOOP_TIMEOUT_MS = 30000;
@@ -42,7 +50,7 @@ export interface SceneRenderer {
 }
 
 export interface RunResult {
-  canvas: { width: number; height: number; format: GPUTextureFormat };
+  canvas: { width: number; height: number; dpr: number; format: GPUTextureFormat };
   adapter: Record<string, string>;
   image: ImageStats;
   /** 読み戻した生の画素（解析の追加に使う。レポートには載せない） */
@@ -64,8 +72,20 @@ export async function runScene(
   scene: SceneRenderer,
   onFirstFrame: () => void,
 ): Promise<RunResult> {
-  canvas.width = WIDTH;
-  canvas.height = HEIGHT;
+  // Retina では CSS 1px = 物理 2px。描画をこれに合わせないと半分の解像度で描いて引き伸ばすことになる
+  // （フェーズ2で実測: 実ディスプレイ DPR 2、キャンバス 1280×720 が物理 2560×1440 を覆っていた）
+  const override = Number(new URLSearchParams(location.search).get('dpr'));
+  const dpr = Number.isFinite(override) && override > 0
+    ? Math.min(MAX_DPR, override)   // 診断用の上書き（?dpr=1）
+    : Math.min(MAX_DPR, Math.max(1, window.devicePixelRatio || 1));
+  resolution.width = Math.round(CSS_WIDTH * dpr);
+  resolution.height = Math.round(CSS_HEIGHT * dpr);
+  resolution.dpr = dpr;
+  canvas.width = resolution.width;
+  canvas.height = resolution.height;
+  const WIDTH = resolution.width;
+  const HEIGHT = resolution.height;
+  const BYTES_PER_ROW = bytesPerRowFor(WIDTH);
 
   const bundle = await acquireDevice();
   const { device, adapter, format, hasTimestampQuery, errors } = bundle;
@@ -200,7 +220,7 @@ export async function runScene(
 
   const shaderMessages = scene.shaderMessages();
   return {
-    canvas: { width: WIDTH, height: HEIGHT, format },
+    canvas: { width: WIDTH, height: HEIGHT, dpr: resolution.dpr, format },
     adapter: adapterInfo,
     image,
     pixels,

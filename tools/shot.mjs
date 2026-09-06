@@ -17,7 +17,7 @@ mkdirSync(OUT_DIR, { recursive: true });
 const vite = startVite(PORT);
 if (!(await waitForServer(ORIGIN))) { console.error('vite 起動せず'); vite.kill(); process.exit(2); }
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
-const context = await browser.newContext({ viewport: { width: 1360, height: 900 }, deviceScaleFactor: 1 });
+const context = await browser.newContext({ viewport: { width: 1360, height: 900 }, deviceScaleFactor: 2  /* 実機は Retina（DPR 2）。スクショも物理解像度 2560×1440 で撮る */ });
 const page = await context.newPage();
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });

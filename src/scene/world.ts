@@ -19,7 +19,7 @@ import waterWgsl from '../shaders/water.wgsl?raw';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
-import { HEIGHT, WIDTH } from '../harness/runner';
+import { resolution } from '../harness/runner';
 import { multiply, perspectiveReversedInfinite, viewRotation } from '../math/mat4';
 import { cross, dirFromAzEl, dot, normalize, type Vec3 } from '../math/vec';
 import type { View } from '../views';
@@ -38,6 +38,11 @@ const NEAR = 0.05;
 const SUN_ANGULAR_RADIUS_DEG = 0.27;
 
 const FRAME_FLOATS = 48;
+/**
+ * MSAA は使わない（既定 1）。Chrome/Metal で 4× MSAA にすると 1 フレーム 200ms になった（実測、DPR1 でも）。
+ * 輪郭の平滑化はトーンマップ時の FXAA で行う。?msaa=4 で再実験できる
+ */
+const MSAA_SAMPLES = (() => { const v = Number(new URLSearchParams(location.search).get('msaa')); return v === 4 ? 4 : 1; })();
 
 /**
  * 高さテクスチャの段構成。近・中・遠の 3 段、各 2048² の r32float（合計 48MB）。
@@ -51,6 +56,11 @@ const HM_TEXELS = [0.25, 1.6, 12.8] as const;
 /** 空の LUT（正距円筒）。空の描画・環境光・映り込みに使う。太陽が固定なので起動時に 1 回焼く */
 const SKY_LUT_W = 512;
 const SKY_LUT_H = 256;
+
+/** 遠景の溶け込みの 3D LUT（方位 × 仰角 × 距離）。カメラ位置ごとに起動時に焼く */
+const AERIAL_W = 64;
+const AERIAL_H = 32;
+const AERIAL_D = 32;
 
 /** 水面メッシュに使う区画索引の範囲（盆地 |u|<484, 北 v<163, 南 v>-121 を余裕をもって覆う） */
 const CELL_I0 = -22;
@@ -99,6 +109,7 @@ export class WorldScene implements SceneRenderer {
   private frameBuffer!: GPUBuffer;
   private frameData = new Float32Array(FRAME_FLOATS);
   private hdr!: GPUTexture;
+  private hdrMsaa!: GPUTexture;
   private depth!: GPUTexture;
   private terrainPipeline!: GPURenderPipeline;
   private skyPipeline!: GPURenderPipeline;
@@ -118,7 +129,11 @@ export class WorldScene implements SceneRenderer {
   private skyReduceBindGroup!: GPUBindGroup;
   private skyIrrBuffer!: GPUBuffer;
   private lightTex!: GPUTexture;
+  private matTex!: GPUTexture;
   private lightBindGroup!: GPUBindGroup;
+  private aerialInTex!: GPUTexture;
+  private aerialTrTex!: GPUTexture;
+  private sunLutBuffer!: GPUBuffer;
   private lightBakeMs = 0;
   private waterPipeline!: GPURenderPipeline;
   private waterBuffer!: GPUBuffer;
@@ -195,14 +210,23 @@ export class WorldScene implements SceneRenderer {
     this.updateFrame();
 
     // --- 描画先 ---
+    const WIDTH = resolution.width;
+    const HEIGHT = resolution.height;
     this.hdr = device.createTexture({
       size: [WIDTH, HEIGHT],
       format: 'rgba16float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.hdrMsaa = device.createTexture({
+      size: [WIDTH, HEIGHT],
+      format: 'rgba16float',
+      sampleCount: MSAA_SAMPLES,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
     this.depth = device.createTexture({
       size: [WIDTH, HEIGHT],
       format: 'depth32float',
+      sampleCount: MSAA_SAMPLES,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
 
@@ -253,19 +277,88 @@ export class WorldScene implements SceneRenderer {
       ],
     });
 
+    // 遠景の溶け込み（3D LUT）と太陽光（1D LUT）
+    this.aerialInTex = device.createTexture({
+      size: [AERIAL_W, AERIAL_H, AERIAL_D], dimension: '3d', format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.aerialTrTex = device.createTexture({
+      size: [AERIAL_W, AERIAL_H, AERIAL_D], dimension: '3d', format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.sunLutBuffer = device.createBuffer({ size: 128 * 16, usage: GPUBufferUsage.STORAGE });
+    const aerialBakeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '3d' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '3d' } },
+      ],
+    });
+    const aerialPipeline = device.createComputePipeline({
+      label: 'bakeAerial',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [aerialBakeLayout] }),
+      compute: { module: skyModule, entryPoint: 'bakeAerial' },
+    });
+    const aerialBakeBindGroup = device.createBindGroup({
+      layout: aerialBakeLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameBuffer } },
+        { binding: 4, resource: this.aerialInTex.createView() },
+        { binding: 5, resource: this.aerialTrTex.createView() },
+      ],
+    });
+    const sunBakeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    const sunPipeline = device.createComputePipeline({
+      label: 'bakeSunLut',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [sunBakeLayout] }),
+      compute: { module: skyModule, entryPoint: 'bakeSunLut' },
+    });
+    const sunBakeBindGroup = device.createBindGroup({
+      layout: sunBakeLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameBuffer } },
+        { binding: 6, resource: { buffer: this.sunLutBuffer } },
+      ],
+    });
+    {
+      const encoder = device.createCommandEncoder();
+      const a = encoder.beginComputePass();
+      a.setPipeline(aerialPipeline);
+      a.setBindGroup(0, aerialBakeBindGroup);
+      a.dispatchWorkgroups(AERIAL_W / 4, AERIAL_H / 4, AERIAL_D / 4);
+      a.end();
+      const b = encoder.beginComputePass();
+      b.setPipeline(sunPipeline);
+      b.setBindGroup(0, sunBakeBindGroup);
+      b.dispatchWorkgroups(2);
+      b.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
     const skyLutLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       ],
     });
     this.skyLutBindGroup = device.createBindGroup({
       layout: skyLutLayout,
       entries: [
         { binding: 0, resource: this.skyLutTex.createView() },
-        { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge' }) },
+        { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' }) },
         { binding: 2, resource: { buffer: this.skyIrrBuffer } },
+        { binding: 3, resource: this.aerialInTex.createView() },
+        { binding: 4, resource: this.aerialTrTex.createView() },
+        { binding: 5, resource: { buffer: this.sunLutBuffer } },
       ],
     });
 
@@ -297,6 +390,7 @@ export class WorldScene implements SceneRenderer {
       fragment: { module: terrainModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+      multisample: { count: MSAA_SAMPLES },
     });
     const waterModule = await this.makeModule(
       'water',
@@ -313,6 +407,7 @@ export class WorldScene implements SceneRenderer {
       fragment: { module: waterModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     this.skyPipeline = device.createRenderPipeline({
@@ -322,12 +417,14 @@ export class WorldScene implements SceneRenderer {
       fragment: { module: skyModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater-equal' },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const tonemapLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
     this.tonemapPipeline = device.createRenderPipeline({
@@ -342,6 +439,7 @@ export class WorldScene implements SceneRenderer {
       entries: [
         { binding: 0, resource: { buffer: this.frameBuffer } },
         { binding: 1, resource: this.hdr.createView() },
+        { binding: 2, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
       ],
     });
 
@@ -458,10 +556,15 @@ export class WorldScene implements SceneRenderer {
       size: [HM_SIZE, HM_SIZE, layers], format: 'rgba16float',
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.matTex = device.createTexture({
+      size: [HM_SIZE, HM_SIZE, layers], format: 'rgba8unorm',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
     const bakeLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '2d-array' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba8unorm', access: 'write-only', viewDimension: '2d-array' } },
       ],
     });
     const pipeline = device.createComputePipeline({
@@ -480,6 +583,7 @@ export class WorldScene implements SceneRenderer {
         entries: [
           { binding: 0, resource: { buffer: layerBuf } },
           { binding: 1, resource: this.lightTex.createView({ dimension: '2d-array' }) },
+          { binding: 2, resource: this.matTex.createView({ dimension: '2d-array' }) },
         ],
       });
       const pass = encoder.beginComputePass();
@@ -496,11 +600,17 @@ export class WorldScene implements SceneRenderer {
     for (const b of scratch) b.destroy();
 
     const layout = device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } }],
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+      ],
     });
     this.lightBindGroup = device.createBindGroup({
       layout,
-      entries: [{ binding: 0, resource: this.lightTex.createView({ dimension: '2d-array' }) }],
+      entries: [
+        { binding: 0, resource: this.lightTex.createView({ dimension: '2d-array' }) },
+        { binding: 1, resource: this.matTex.createView({ dimension: '2d-array' }) },
+      ],
     });
     return layout;
   }
@@ -620,17 +730,17 @@ export class WorldScene implements SceneRenderer {
     const { forward, right, up, tanHalfFov } = this.cameraBasis;
     const dz = dot(dir, forward);
     if (dz <= 1e-6) return null;
-    const ndcX = dot(dir, right) / dz / (tanHalfFov * (WIDTH / HEIGHT));
+    const ndcX = dot(dir, right) / dz / (tanHalfFov * (resolution.width / resolution.height));
     const ndcY = dot(dir, up) / dz / tanHalfFov;
-    return { x: ((ndcX + 1) / 2) * WIDTH, y: ((1 - ndcY) / 2) * HEIGHT };
+    return { x: ((ndcX + 1) / 2) * resolution.width, y: ((1 - ndcY) / 2) * resolution.height };
   }
 
   /** 画素座標 → 世界の方向 */
   pixelToDir(x: number, y: number): Vec3 {
     const { forward, right, up, tanHalfFov } = this.cameraBasis;
-    const ndcX = (x / WIDTH) * 2 - 1;
-    const ndcY = 1 - (y / HEIGHT) * 2;
-    const a = ndcX * (WIDTH / HEIGHT) * tanHalfFov;
+    const ndcX = (x / resolution.width) * 2 - 1;
+    const ndcY = 1 - (y / resolution.height) * 2;
+    const a = ndcX * (resolution.width / resolution.height) * tanHalfFov;
     const b = ndcY * tanHalfFov;
     return normalize([
       forward[0] + right[0] * a + up[0] * b,
@@ -644,7 +754,7 @@ export class WorldScene implements SceneRenderer {
     const s = this.resolved.sunDir;
     const reflectedDir: Vec3 = [s[0], -s[1], s[2]];
     const horizon = this.dirToPixel([this.cameraBasis.forward[0], 0, this.cameraBasis.forward[2]]);
-    return { reflectedDir, pixel: this.dirToPixel(reflectedDir), horizonY: horizon ? horizon.y : HEIGHT / 2 };
+    return { reflectedDir, pixel: this.dirToPixel(reflectedDir), horizonY: horizon ? horizon.y : resolution.height / 2 };
   }
 
   /** world.wgsl の高さを CPU から問い合わせる（正本は WGSL のみ、という約束の実装） */
@@ -690,7 +800,7 @@ export class WorldScene implements SceneRenderer {
     const worldUp: Vec3 = [0, 1, 0];
     const right = normalize(cross(forward, worldUp));
     const up = cross(right, forward);
-    const aspect = WIDTH / HEIGHT;
+    const aspect = resolution.width / resolution.height;
     const fov = (v.fovDeg * Math.PI) / 180;
     const viewProj = multiply(perspectiveReversedInfinite(fov, aspect, NEAR), viewRotation(forward, worldUp));
     const sunDir = dirFromAzEl(v.sunAzimuthDeg, v.sunElevationDeg);
@@ -707,13 +817,14 @@ export class WorldScene implements SceneRenderer {
     f.set([sunDir[0], sunDir[1], sunDir[2], Math.cos((SUN_ANGULAR_RADIUS_DEG * Math.PI) / 180)], 32);
     f.set([v.time, v.exposure, aspect, v.debug], 36);
     f.set([RING_R0, RING_K, RING_COUNT, RING_SECTORS], 40);
-    f.set([eye[0], eye[2], 0, 0], 44);
+    f.set([eye[0], eye[2], resolution.width, resolution.height], 44);
     this.device.queue.writeBuffer(this.frameBuffer, 0, f);
   }
 
   render(ctx: FrameContext): void {
     const { encoder } = ctx;
-    const hdrView = this.hdr.createView();
+    const hdrView = MSAA_SAMPLES > 1 ? this.hdrMsaa.createView() : this.hdr.createView();
+    const resolveView = this.hdr.createView();
     const depthView = this.depth.createView();
 
     // 1. 地形（HDR へ。深度は逆 Z で 0 クリア）。空の LUT は起動時に焼いてある
@@ -749,7 +860,8 @@ export class WorldScene implements SceneRenderer {
 
     // 2. 空（地形の無い画素だけ）
     const sky = encoder.beginRenderPass({
-      colorAttachments: [{ view: hdrView, loadOp: 'load', storeOp: 'store' }],
+      // HDR へ描く最後のパス。ここで MSAA を解決して tonemap が読む hdr に落とす
+      colorAttachments: [{ view: hdrView, ...(MSAA_SAMPLES > 1 ? { resolveTarget: resolveView } : {}), loadOp: 'load', storeOp: 'store' }],
       depthStencilAttachment: { view: depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
     });
     sky.setPipeline(this.skyPipeline);
@@ -776,6 +888,7 @@ export class WorldScene implements SceneRenderer {
       resolved: this.resolved,
       heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
       water: this.waterStats,
+      resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,
         rings: RING_COUNT,

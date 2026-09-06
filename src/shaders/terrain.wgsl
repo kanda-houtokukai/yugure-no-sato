@@ -50,40 +50,38 @@ fn fs(in: VSOut) -> FSOut {
   let viewDir = toCam / dist;
 
   // 画素の足元の大きさ。遠方ほど細部を落として暴れを抑える
-  let pixelSize = dist * frame.camUp.w * 2.0 / 720.0;
+  let pixelSize = dist * frame.camUp.w * 2.0 / frame.center.w;
   let minWl = max(pixelSize * 2.0, 0.04);
 
   var out: FSOut;
   let dbg = frame.params.w;
   if (dbg == 4.0) { out.color = vec4f(0.3, 0.5, 0.2, 1.0); return out; }   // 計測用: フラグメントの仕事を全部飛ばす
 
-  // 材質は数式を画素ごとに 1 回だけ評価（これは軽い）。法線は焼いた高さテクスチャから
-  let s = terrainSurface(p, minWl);
-  // 法線と日向/日陰は焼いたもの 1 タップ（計測用 dbg=7: 双三次で直接計算、dbg=8: 影を行進で直接計算）
+  // 材質・法線・日向/日陰はすべて焼いたもの（画素ごとに数式を評価しない）
   let baked = bakedLight(p);
-  let n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);
-
-  let albedo = terrainAlbedo(p, s);
+  let n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);   // 計測用 dbg=7: 双三次で直接計算
+  let albedo = baked.albedo;
   let sun = frame.sunDir.xyz;
   let ndl = max(dot(n, sun), 0.0);
 
-  // 太陽光: 大気を抜けてきた色 × 地形の影
-  let sunLight = SUN_E * sunTransmittance(toPlanet(in.world), sun, 6);
-  // 日向/日陰は焼いたもの 1 タップ（計測用 dbg=8: 行進で直接計算）
-  let shadow = select(baked.shadow, terrainShadow(in.world, sun), dbg == 8.0);
+  // 太陽光: 高度ごとの透過後の色（1D LUT）× 地形の影
+  let sunLight = sunLightAt(in.world.y);
+  let shadow = select(baked.shadow, terrainShadow(in.world, sun), dbg == 8.0);   // 計測用 dbg=8: 影を行進で直接計算
   let ambient = skyAmbient(n);
   var color = albedo * (ndl * shadow * sunLight + ambient);
 
-  // 遠景の溶け込み: 視線上の散乱と透過
-  let air = atmosphereMarch(frame.camPos.xyz, -viewDir, sun, dist, 6, 2);
+  // 遠景の溶け込み（3D LUT）
+  let air = aerialLut(-viewDir, dist);
   color = color * air.transmittance + air.inscatter;
 
+  let sKind = baked.kind;
+  let sHeight = in.world.y;
   // デバッグ表示: params.w == 1 で法線、2 で材質種別、3 で高さ
   if (dbg == 1.0) { color = n * 0.5 + 0.5; }
   else if (dbg == 2.0) {
-    let k = f32(s.kind);
+    let k = f32(sKind);
     color = vec3f(fract(k * 0.37 + 0.1), fract(k * 0.61 + 0.5), fract(k * 0.83 + 0.2));
-  } else if (dbg == 3.0) { color = vec3f(fract(s.height), fract(s.height * 0.1), fract(s.height * 0.01)); }
+  } else if (dbg == 3.0) { color = vec3f(fract(sHeight), fract(sHeight * 0.1), fract(sHeight * 0.01)); }
 
   out.color = vec4f(color, 1.0);
   return out;
