@@ -1,18 +1,21 @@
-// フェーズ0 停止ポイント①: この Mac の Chrome で WebGPU が実際に取れるかを機械確認する。
-// 依存パッケージなし（Node 標準のみ）。vite を立て、Chrome を起動条件を変えながら開き、
+// この Mac の Chrome で WebGPU が実際に取れるかを機械確認する（フェーズ0 停止ポイント①で使用）。
+// 依存パッケージなし（Node 標準のみ）。Chrome を起動条件を変えながら開き、
 // ページが送ってきた診断 JSON を読む。どの起動条件で通ったかも記録する。
+//
+// 実測結果（2026-09-06）: 4通りすべて成功。特別な起動フラグは不要でヘッドレスでも動く。
+// 環境が変わったとき（Chrome 更新・別マシン）に再実行して前提を取り直すためのもの。
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { ROOT, sleep, startVite, waitForServer } from './dev-server.mjs';
 
-const ROOT = resolve(import.meta.dirname, '..');
 const OUT_DIR = join(ROOT, '.screenshots');
 const LATEST = join(OUT_DIR, 'probe-latest.json');
 const PORT = 5199;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
+const PAGE_URL = `${ORIGIN}/?mode=probe`;
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
@@ -27,37 +30,6 @@ const CANDIDATES = [
   },
 ];
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function waitForServer(timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${ORIGIN}/`, { signal: AbortSignal.timeout(2000) });
-      if (res.ok) return true;
-    } catch {
-      /* まだ起動していない */
-    }
-    await sleep(250);
-  }
-  return false;
-}
-
-function startVite() {
-  const bin = join(ROOT, 'node_modules', '.bin', 'vite');
-  if (!existsSync(bin)) {
-    console.error(`vite が見つからない: ${bin}\nnpm install を先に実行すること。`);
-    process.exit(2);
-  }
-  const child = spawn(bin, ['--port', String(PORT), '--strictPort'], {
-    cwd: ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stdout.on('data', (d) => process.stdout.write(`[vite] ${d}`));
-  child.stderr.on('data', (d) => process.stderr.write(`[vite:err] ${d}`));
-  return child;
-}
-
 async function tryCandidate(candidate) {
   rmSync(LATEST, { force: true });
   const profile = mkdtempSync(join(tmpdir(), 'yugure-chrome-'));
@@ -68,7 +40,7 @@ async function tryCandidate(candidate) {
     '--disable-background-timer-throttling',
     '--window-size=900,700',
     ...candidate.flags,
-    `${ORIGIN}/`,
+    PAGE_URL,
   ];
   const chrome = spawn(CHROME, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   const chromeLog = [];
@@ -97,7 +69,6 @@ async function tryCandidate(candidate) {
   return {
     candidate: candidate.name,
     flags: candidate.flags,
-    reached: report !== null,
     ok: report?.ok === true,
     stage: report?.stage ?? null,
     error: report?.error ?? (report ? null : 'ページから診断が届かなかった（タイムアウト）'),
@@ -108,14 +79,15 @@ async function tryCandidate(candidate) {
 
 async function main() {
   mkdirSync(OUT_DIR, { recursive: true });
-  const vite = startVite();
-  const cleanup = () => {
-    vite.kill('SIGTERM');
-  };
+  const vite = startVite(PORT, { quiet: false });
+  const cleanup = () => vite.kill('SIGTERM');
   process.on('exit', cleanup);
-  process.on('SIGINT', () => { cleanup(); process.exit(130); });
+  process.on('SIGINT', () => {
+    cleanup();
+    process.exit(130);
+  });
 
-  if (!(await waitForServer())) {
+  if (!(await waitForServer(ORIGIN))) {
     console.error('dev サーバが起動しなかった');
     cleanup();
     process.exit(2);
@@ -143,14 +115,10 @@ async function main() {
 
   if (winner) {
     const r = winner.report;
-    console.log('\n--- 動いた起動条件 ---');
-    console.log(`  ${winner.candidate}`);
+    console.log(`\n--- 動いた起動条件 ---\n  ${winner.candidate}`);
     console.log('\n--- アダプタ ---');
     console.log(JSON.stringify(r.adapter.info, null, 2));
-    console.log(`  isFallbackAdapter: ${r.adapter.isFallbackAdapter}`);
     console.log(`  preferredCanvasFormat: ${r.preferredCanvasFormat}`);
-    console.log('\n--- adapter.features ---');
-    console.log('  ' + r.adapter.features.join('\n  '));
     console.log('\n--- 主要な上限値 (adapter.limits) ---');
     for (const k of Object.keys(r.adapter.limits).sort()) {
       console.log(`  ${k}: ${r.adapter.limits[k]}`);

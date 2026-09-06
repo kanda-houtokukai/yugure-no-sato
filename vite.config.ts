@@ -27,13 +27,13 @@ function sinkPlugin(): Plugin {
       server.middlewares.use('/__sink', (req, res) => {
         if (req.method !== 'POST') {
           res.statusCode = 405;
-          res.end('POST only');
+          res.end('{"ok":false,"error":"POST only"}');
           return;
         }
         const name = decodeURIComponent((req.url ?? '/').replace(/^\//, '')) || 'unnamed';
         if (!/^[A-Za-z0-9_-]+$/.test(name)) {
           res.statusCode = 400;
-          res.end('bad name');
+          res.end('{"ok":false,"error":"bad name"}');
           return;
         }
         const chunks: Buffer[] = [];
@@ -43,8 +43,11 @@ function sinkPlugin(): Plugin {
           mkdirSync(OUT_DIR, { recursive: true });
           writeFileSync(resolve(OUT_DIR, `${name}-${stamp()}.json`), body);
           writeFileSync(resolve(OUT_DIR, `${name}-latest.json`), body);
-          res.statusCode = 204;
-          res.end();
+          // 本文の無い 204 を返すと、書き込みが成功していても Chrome が要求を
+          // net::ERR_ABORTED として扱い、verify が偽の異常を報告する。必ず本文を返す
+          res.statusCode = 200;
+          res.setHeader('content-type', 'application/json');
+          res.end('{"ok":true}');
         });
       });
     },

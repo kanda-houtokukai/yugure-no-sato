@@ -8,10 +8,12 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "probe": "node tools/probe.mjs"
+    "probe": "node tools/probe.mjs",
+    "verify": "node tools/verify.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.72",
+    "playwright": "^1.63.0",
     "typescript": "^7.0.2",
     "vite": "^8.2.2"
   }

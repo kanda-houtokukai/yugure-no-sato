@@ -3,14 +3,20 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>夕暮れの里 — WebGPU 確認</title>
+    <!-- 素材ゼロの原則によりアイコンファイルは置かない。
+         空の data URI にして favicon.ico の要求自体を無くす（無いと 404 が verify を汚す） -->
+    <link rel="icon" href="data:," />
+    <title>夕暮れの里 — 検証用ハーネス</title>
     <style>
-      html, body { margin: 0; height: 100%; background: #14161c; color: #d8dbe2; }
-      body { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 12px; }
-      pre { white-space: pre-wrap; word-break: break-all; margin: 0; }
+      html, body { margin: 0; background: #14161c; color: #d8dbe2; }
+      body { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+      /* スクショはこのキャンバスだけを撮る。CSS サイズと解像度を一致させておく */
+      #view { display: block; width: 1280px; height: 720px; }
+      #out { white-space: pre-wrap; word-break: break-all; margin: 0; padding: 12px; }
     </style>
   </head>
   <body>
+    <canvas id="view" width="1280" height="720"></canvas>
     <pre id="out">起動中…</pre>
     <script type="module" src="/src/main.ts"></script>
   </body>
