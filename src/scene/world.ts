@@ -18,6 +18,7 @@ import lightsampleWgsl from '../shaders/lightsample.wgsl?raw';
 import waterWgsl from '../shaders/water.wgsl?raw';
 import windWgsl from '../shaders/wind.wgsl?raw';
 import riceWgsl from '../shaders/rice.wgsl?raw';
+import grassWgsl from '../shaders/grass.wgsl?raw';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
@@ -86,6 +87,10 @@ const RIVER_LEVEL = -1.0;
 const RICE_MAX = 160000;
 const RICE_NEAR_VERTS = 7 * 3 * 6;   // 葉 7 枚 × 3 節 × 6 頂点
 const RICE_MID_VERTS = 2 * 6;        // 交差する板 2 枚
+/** 草: 稲と同じ仕組み。葉 5 枚 × 2 節 */
+const GRASS_MAX = 120000;
+const GRASS_NEAR_VERTS = 5 * 2 * 6;
+const GRASS_MID_VERTS = 2 * 6;
 
 function buildRingIndices(rings: number, sectors: number): Uint32Array {
   const fan = sectors * 3;
@@ -159,6 +164,14 @@ export class WorldScene implements SceneRenderer {
   private riceComputeBindGroup!: GPUBindGroup;
   private riceComputeLayout!: GPUBindGroupLayout;
   private riceCounts = { near: 0, mid: 0 };
+  private grassSpawnNear!: GPUComputePipeline;
+  private grassSpawnMid!: GPUComputePipeline;
+  private grassNearPipeline!: GPURenderPipeline;
+  private grassMidPipeline!: GPURenderPipeline;
+  private grassArgs!: GPUBuffer;
+  private grassNearBuf!: GPUBuffer;
+  private grassMidBuf!: GPUBuffer;
+  private grassCounts = { near: 0, mid: 0 };
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -198,6 +211,10 @@ export class WorldScene implements SceneRenderer {
     this.riceMidBuf = device.createBuffer({ size: RICE_MAX * 32, usage: GPUBufferUsage.STORAGE });
     this.riceArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(this.riceArgs, 0, new Uint32Array([RICE_NEAR_VERTS, 0, 0, 0, RICE_MID_VERTS, 0, 0, 0]));
+    this.grassNearBuf = device.createBuffer({ size: GRASS_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.grassMidBuf = device.createBuffer({ size: GRASS_MAX * 32, usage: GPUBufferUsage.STORAGE });
+    this.grassArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    device.queue.writeBuffer(this.grassArgs, 0, new Uint32Array([GRASS_NEAR_VERTS, 0, 0, 0, GRASS_MID_VERTS, 0, 0, 0]));
 
     const worldCode = commonWgsl + noiseWgsl + worldWgsl;
     const queryModule = await this.makeModule('query', worldCode + queryWgsl);
@@ -502,6 +519,38 @@ export class WorldScene implements SceneRenderer {
       });
     }
 
+    // --- 草（稲と同じ仕組み） ---
+    {
+      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      const section = (src: string, name: string): string => {
+        const start = src.indexOf(`// ==== SECTION: ${name} ====`);
+        const rest = src.slice(start);
+        const next = rest.indexOf('// ==== SECTION:', 10);
+        return next < 0 ? rest : rest.slice(0, next);
+      };
+      // leafShade は rice.wgsl の描画節にあるので、草の描画モジュールにも稲の描画節を含める
+      const computeModule = await this.makeModule('grassSpawn', common + section(grassWgsl, 'common') + section(grassWgsl, 'spawn'));
+      const renderModule = await this.makeModule('grass', common + section(riceWgsl, 'common') + section(riceWgsl, 'draw') + section(grassWgsl, 'common') + section(grassWgsl, 'draw'));
+      const computePL = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, this.riceComputeLayout] });
+      this.grassSpawnNear = device.createComputePipeline({ label: 'spawnGrassNear', layout: computePL, compute: { module: computeModule, entryPoint: 'spawnGrassNear' } });
+      this.grassSpawnMid = device.createComputePipeline({ label: 'spawnGrassMid', layout: computePL, compute: { module: computeModule, entryPoint: 'spawnGrassMid' } });
+      const depth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' };
+      this.grassNearPipeline = device.createRenderPipeline({
+        label: 'grassNear', layout: frameAndHeight,
+        vertex: { module: renderModule, entryPoint: 'vsGrassNear' },
+        fragment: { module: renderModule, entryPoint: 'fsGrassNear', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depth, multisample: { count: MSAA_SAMPLES },
+      });
+      this.grassMidPipeline = device.createRenderPipeline({
+        label: 'grassMid', layout: frameAndHeight,
+        vertex: { module: renderModule, entryPoint: 'vsGrassMid' },
+        fragment: { module: renderModule, entryPoint: 'fsGrassMid', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depth, multisample: { count: MSAA_SAMPLES },
+      });
+    }
+
     this.skyPipeline = device.createRenderPipeline({
       label: 'sky',
       layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout] }),
@@ -698,6 +747,8 @@ export class WorldScene implements SceneRenderer {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
         { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+        { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       ],
     });
     this.lightBindGroup = device.createBindGroup({
@@ -707,6 +758,8 @@ export class WorldScene implements SceneRenderer {
         { binding: 1, resource: this.matTex.createView({ dimension: '2d-array' }) },
         { binding: 2, resource: { buffer: this.riceNearBuf } },
         { binding: 3, resource: { buffer: this.riceMidBuf } },
+        { binding: 5, resource: { buffer: this.grassNearBuf } },
+        { binding: 6, resource: { buffer: this.grassMidBuf } },
       ],
     });
     this.riceComputeLayout = device.createBindGroupLayout({
@@ -716,6 +769,9 @@ export class WorldScene implements SceneRenderer {
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ],
     });
     this.riceComputeBindGroup = device.createBindGroup({
@@ -726,6 +782,9 @@ export class WorldScene implements SceneRenderer {
         { binding: 2, resource: { buffer: this.riceNearBuf } },
         { binding: 3, resource: { buffer: this.riceMidBuf } },
         { binding: 4, resource: { buffer: this.riceArgs } },
+        { binding: 5, resource: { buffer: this.grassNearBuf } },
+        { binding: 6, resource: { buffer: this.grassMidBuf } },
+        { binding: 7, resource: { buffer: this.grassArgs } },
       ],
     });
     return layout;
@@ -964,6 +1023,8 @@ export class WorldScene implements SceneRenderer {
     // 0. 稲のインスタンスをカメラ周りに生成（毎フレーム。フェーズ3で歩いても追従する）
     encoder.clearBuffer(this.riceArgs, 4, 4);
     encoder.clearBuffer(this.riceArgs, 20, 4);
+    encoder.clearBuffer(this.grassArgs, 4, 4);
+    encoder.clearBuffer(this.grassArgs, 20, 4);
     if (!skipSpawn) {
       const spawn = encoder.beginComputePass();
       spawn.setBindGroup(0, this.frameBindGroup);
@@ -974,6 +1035,10 @@ export class WorldScene implements SceneRenderer {
       spawn.dispatchWorkgroups(272 / 8, 368 / 8);
       spawn.setPipeline(this.riceSpawnMid);
       spawn.dispatchWorkgroups(336 / 8, 336 / 8);
+      spawn.setPipeline(this.grassSpawnNear);
+      spawn.dispatchWorkgroups(176 / 8, 176 / 8);
+      spawn.setPipeline(this.grassSpawnMid);
+      spawn.dispatchWorkgroups(208 / 8, 208 / 8);
       spawn.end();
     }
 
@@ -1003,6 +1068,11 @@ export class WorldScene implements SceneRenderer {
       scene.drawIndirect(this.riceArgs, 0);
       scene.setPipeline(this.riceMidPipeline);
       scene.drawIndirect(this.riceArgs, 16);
+      // 1d. 草
+      scene.setPipeline(this.grassNearPipeline);
+      scene.drawIndirect(this.grassArgs, 0);
+      scene.setPipeline(this.grassMidPipeline);
+      scene.drawIndirect(this.grassArgs, 16);
     }
     scene.end();
 
@@ -1046,6 +1116,15 @@ export class WorldScene implements SceneRenderer {
     read.unmap();
     read.destroy();
     this.riceCounts = { near: Math.min(v[1], RICE_MAX), mid: Math.min(v[5], RICE_MAX) };
+    const read2 = device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc2 = device.createCommandEncoder();
+    enc2.copyBufferToBuffer(this.grassArgs, 0, read2, 0, 32);
+    device.queue.submit([enc2.finish()]);
+    await read2.mapAsync(GPUMapMode.READ);
+    const g = new Uint32Array(read2.getMappedRange().slice(0));
+    read2.unmap();
+    read2.destroy();
+    this.grassCounts = { near: Math.min(g[1], GRASS_MAX), mid: Math.min(g[5], GRASS_MAX) };
     return this.riceCounts;
   }
 
@@ -1056,6 +1135,7 @@ export class WorldScene implements SceneRenderer {
       heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
       water: this.waterStats,
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
+      grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,

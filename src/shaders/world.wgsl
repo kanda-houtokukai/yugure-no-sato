@@ -256,7 +256,8 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
     let pathH = h + (path.top - h) * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
     if (path.dist < hw + 0.7 * widen && pathH > h) {
       h = pathH;
-      if (path.on) { s.kind = KIND_PATH; s.wet = 0.0; }
+      // 道の上は土、土手の斜面（道の縁から 0.7m）は草。田の泥が道の際まで来ないようにする
+      if (path.on) { s.kind = KIND_PATH; s.wet = 0.0; } else { s.kind = KIND_RIDGE; s.wet = 0.0; }
     }
     s.ridgeDist = min(s.ridgeDist, path.dist);
   }
