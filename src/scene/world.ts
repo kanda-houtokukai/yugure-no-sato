@@ -19,6 +19,8 @@ import waterWgsl from '../shaders/water.wgsl?raw';
 import windWgsl from '../shaders/wind.wgsl?raw';
 import riceWgsl from '../shaders/rice.wgsl?raw';
 import grassWgsl from '../shaders/grass.wgsl?raw';
+import treeWgsl from '../shaders/tree.wgsl?raw';
+import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
@@ -172,6 +174,9 @@ export class WorldScene implements SceneRenderer {
   private grassNearBuf!: GPUBuffer;
   private grassMidBuf!: GPUBuffer;
   private grassCounts = { near: 0, mid: 0 };
+  private treePipeline!: GPURenderPipeline;
+  private treeDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
+  private treeStats = { total: 0, variants: [] as { name: string; vertices: number; instances: number }[] };
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -247,6 +252,8 @@ export class WorldScene implements SceneRenderer {
 
     // --- 水面メッシュ（区画の形と川の中心線を正本から読み戻して組む） ---
     await this.buildWater();
+    // --- 木（テンプレートを数値から起こし、配置を正本に問い合わせて確定） ---
+    await this.buildTrees();
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -548,6 +555,47 @@ export class WorldScene implements SceneRenderer {
         fragment: { module: renderModule, entryPoint: 'fsGrassMid', targets: [{ format: 'rgba16float' }] },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depth, multisample: { count: MSAA_SAMPLES },
+      });
+    }
+
+    // --- 木 ---
+    {
+      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl;
+      const section = (src: string, name: string): string => {
+        const start = src.indexOf(`// ==== SECTION: ${name} ====`);
+        const rest = src.slice(start);
+        const next = rest.indexOf('// ==== SECTION:', 10);
+        return next < 0 ? rest : rest.slice(0, next);
+      };
+      const treeModule = await this.makeModule('tree', common + section(riceWgsl, 'common') + section(riceWgsl, 'draw') + treeWgsl);
+      this.treePipeline = device.createRenderPipeline({
+        label: 'tree', layout: frameAndHeight,
+        vertex: {
+          module: treeModule, entryPoint: 'vsTree',
+          buffers: [
+            {
+              arrayStride: TREE_VERTEX_FLOATS * 4, stepMode: 'vertex',
+              attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                { shaderLocation: 1, offset: 12, format: 'float32x3' },
+                { shaderLocation: 2, offset: 24, format: 'float32x2' },
+                { shaderLocation: 3, offset: 32, format: 'float32' },
+                { shaderLocation: 4, offset: 36, format: 'float32' },
+              ],
+            },
+            {
+              arrayStride: 32, stepMode: 'instance',
+              attributes: [
+                { shaderLocation: 5, offset: 0, format: 'float32x4' },
+                { shaderLocation: 6, offset: 16, format: 'float32x4' },
+              ],
+            },
+          ],
+        },
+        fragment: { module: treeModule, entryPoint: 'fsTree', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+        multisample: { count: MSAA_SAMPLES },
       });
     }
 
@@ -900,6 +948,62 @@ export class WorldScene implements SceneRenderer {
     if (data.byteLength > 0) this.device.queue.writeBuffer(this.waterBuffer, 0, data);
   }
 
+  /** 木: テンプレートを数値から起こし、配置（谷座標）を正本への問い合わせで世界座標に直す */
+  private async buildTrees(): Promise<void> {
+    const device = this.device;
+    const variants = buildTreeVariants();
+    const plan = planTrees();
+
+    // 吸着するもの（参道の並木）と、そのままの (u,v) のものを分けて問い合わせる
+    const snapIdx = plan.map((t, i) => (t.snap ? i : -1)).filter((i) => i >= 0);
+    const xz = plan.map((t) => [t.u, 0] as [number, number]);
+    if (snapIdx.length > 0) {
+      // 縦線への吸着: (family, index, x, z) で z は谷座標 v から川の分を後で足す。ここでは v → 仮の z = v として渡し、
+      // snapQuery は z − riverZ(x) を v として扱うので、先に riverZ を足しておく
+      const rz = new Float32Array(await this.runQuery('riverQuery', [
+        { binding: 6, data: new Float32Array(snapIdx.map((i) => plan[i].u)), type: 'read-only-storage' },
+      ], { binding: 7, byteLength: snapIdx.length * 4 }, Math.ceil(snapIdx.length / 64)));
+      const q = new Float32Array(snapIdx.length * 4);
+      const off = new Float32Array(snapIdx.length);
+      snapIdx.forEach((i, k) => {
+        const t = plan[i];
+        q.set([0, t.snap!.index, t.u, t.v + rz[k]], k * 4);
+        off[k] = t.snap!.offset;
+      });
+      const out = new Float32Array(await this.runQuery('snapQuery', [
+        { binding: 4, data: q, type: 'read-only-storage' },
+        { binding: 8, data: off, type: 'read-only-storage' },
+      ], { binding: 5, byteLength: snapIdx.length * 8 }, Math.ceil(snapIdx.length / 64)));
+      snapIdx.forEach((i, k) => { xz[i] = [out[k * 2], out[k * 2 + 1]]; });
+    }
+    const plainIdx = plan.map((t, i) => (t.snap ? -1 : i)).filter((i) => i >= 0);
+    if (plainIdx.length > 0) {
+      const rz = new Float32Array(await this.runQuery('riverQuery', [
+        { binding: 6, data: new Float32Array(plainIdx.map((i) => plan[i].u)), type: 'read-only-storage' },
+      ], { binding: 7, byteLength: plainIdx.length * 4 }, Math.ceil(plainIdx.length / 64)));
+      plainIdx.forEach((i, k) => { xz[i] = [plan[i].u, plan[i].v + rz[k]]; });
+    }
+    const heights = await this.queryHeights(this.queryModule, xz);
+
+    this.treeDraws = [];
+    this.treeStats = { total: plan.length, variants: [] };
+    variants.forEach((variant, vi) => {
+      const mine = plan.map((t, i) => (t.variant === vi ? i : -1)).filter((i) => i >= 0);
+      const inst = new Float32Array(Math.max(1, mine.length) * 8);
+      mine.forEach((i, k) => {
+        const t = plan[i];
+        inst.set([xz[i][0], heights[i], xz[i][1], t.scale, t.rotation, 1, variant.species, (i * 0.618) % 1], k * 8);
+      });
+      const mesh = device.createBuffer({ size: variant.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(mesh, 0, variant.vertices);
+      const instances = device.createBuffer({ size: inst.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(instances, 0, inst);
+      const vertexCount = variant.vertices.length / TREE_VERTEX_FLOATS;
+      this.treeDraws.push({ mesh, vertexCount, instances, instanceCount: mine.length, name: variant.name });
+      this.treeStats.variants.push({ name: variant.name, vertices: vertexCount, instances: mine.length });
+    });
+  }
+
   /** 世界の方向 → 画素座標（画面外なら null） */
   dirToPixel(dir: Vec3): { x: number; y: number } | null {
     const { forward, right, up, tanHalfFov } = this.cameraBasis;
@@ -1074,6 +1178,13 @@ export class WorldScene implements SceneRenderer {
       scene.setPipeline(this.grassMidPipeline);
       scene.drawIndirect(this.grassArgs, 16);
     }
+    // 1e. 木（種ごとのテンプレートをインスタンス描画）
+    scene.setPipeline(this.treePipeline);
+    for (const d of this.treeDraws) {
+      scene.setVertexBuffer(0, d.mesh);
+      scene.setVertexBuffer(1, d.instances);
+      scene.draw(d.vertexCount, d.instanceCount);
+    }
     scene.end();
 
     // 2. 空（地形の無い画素だけ）
@@ -1136,6 +1247,7 @@ export class WorldScene implements SceneRenderer {
       water: this.waterStats,
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },
+      trees: this.treeStats,
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
         sectors: RING_SECTORS,
