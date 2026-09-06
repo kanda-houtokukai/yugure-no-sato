@@ -17,11 +17,15 @@ export interface View {
   readonly debug: number;
 }
 
-/** 夏の夕暮れ。太陽は西北西の低空（[DECISION] 2）。主要な視点は北向きなので逆光になる */
-const SUN_AZ = 300;
+/**
+ * 夏の夕暮れ。太陽は低空（[DECISION] 2）。方位は谷の出口（西）に合わせる。
+ * 盆地を囲む丘（70m）や山（400m）は仰角 3.5° の太陽を隠してしまうので、
+ * 川が西へ抜ける切れ目を低くし、そこへ夕日を沈める（world.wgsl の outlet）。
+ */
+const SUN_AZ = 275;
 const SUN_EL = 3.5;
 
-const base = { time: 0, sunAzimuthDeg: SUN_AZ, sunElevationDeg: SUN_EL, exposure: 1.0, debug: 0 };
+const base = { time: 0, sunAzimuthDeg: SUN_AZ, sunElevationDeg: SUN_EL, exposure: 0.45, debug: 0 };
 
 export const VIEWS: Readonly<Record<string, View>> = {
   // 集落側（南）のあぜ道に立ち、田を越えて神社の丘（北）を望む
@@ -31,7 +35,7 @@ export const VIEWS: Readonly<Record<string, View>> = {
   // 主道の上、地面すれすれから北へ
   ground: { name: 'ground', eye: { x: 0.9, z: -70, above: 0.12 }, yawDeg: 0, pitchDeg: 1, fovDeg: 65, ...base },
   // 畦にしゃがみ、夕日の方向へ田の水面を見る（水面の見せ場）
-  water: { name: 'water', eye: { x: -32, z: 22, above: 0.9 }, yawDeg: 300, pitchDeg: -3, fovDeg: 55, ...base },
+  water: { name: 'water', eye: { x: -32, z: 22, above: 0.9 }, yawDeg: 272, pitchDeg: -3, fovDeg: 55, ...base },
 };
 
 export const VIEW_NAMES = Object.keys(VIEWS);

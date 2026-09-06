@@ -59,21 +59,13 @@ fn sampleHeightCubic(levelIndex: i32, p: vec2f) -> f32 {
   return mix(mix(a, b, s1.x / (s0.x + s1.x)), mix(c, d, s1.x / (s0.x + s1.x)), s1.y / (s0.y + s1.y));
 }
 
-/** 法線。最も細かい段（近景）は双三次、それ以外は双線形。差分の刻みは画素の足元とテクセルの大きい方 */
+/** 法線。全段を双三次で読む（斜め光では法線 1° の誤差が明るさ 30% の縞になる）。差分の刻みは画素の足元とテクセルの大きい方 */
 fn sampleNormal(p: vec2f, pixelSize: f32) -> vec3f {
   let li = heightLevelFor(p);
   let d = max(hmLevels.l[li].z, pixelSize * 0.75);
-  var hl: f32; var hr: f32; var hd: f32; var hu: f32;
-  if (li == 0) {
-    hl = sampleHeightCubic(0, p - vec2f(d, 0.0));
-    hr = sampleHeightCubic(0, p + vec2f(d, 0.0));
-    hd = sampleHeightCubic(0, p - vec2f(0.0, d));
-    hu = sampleHeightCubic(0, p + vec2f(0.0, d));
-  } else {
-    hl = sampleHeight(li, p - vec2f(d, 0.0));
-    hr = sampleHeight(li, p + vec2f(d, 0.0));
-    hd = sampleHeight(li, p - vec2f(0.0, d));
-    hu = sampleHeight(li, p + vec2f(0.0, d));
-  }
+  let hl = sampleHeightCubic(li, p - vec2f(d, 0.0));
+  let hr = sampleHeightCubic(li, p + vec2f(d, 0.0));
+  let hd = sampleHeightCubic(li, p - vec2f(0.0, d));
+  let hu = sampleHeightCubic(li, p + vec2f(0.0, d));
   return normalize(vec3f(hl - hr, 2.0 * d, hd - hu));
 }

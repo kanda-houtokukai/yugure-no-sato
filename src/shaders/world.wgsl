@@ -198,9 +198,13 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   s.wet = 0.0;
   s.kind = KIND_GROUND;
 
+  // 谷の出口: 川が西へ抜ける切れ目。ここを低くして、そこに夕日が沈むようにする
+  // （盆地周りの丘 70m・山 400m は仰角 3.5° の太陽を隠してしまう。計算は台帳参照）
+  let outlet = smootherstep(-320.0, -620.0, uv.x) * (1.0 - smootherstep(110.0, 260.0, abs(uv.y)));
+
   var h = floorH;
-  if (t > 0.85) { h += hills(p, t, minWl); }
-  if (t > 5.9) { h += mountains(p, t, minWl); }
+  if (t > 0.85) { h += hills(p, t, minWl) * (1.0 - 0.7 * outlet); }
+  if (t > 5.9) { h += mountains(p, t, minWl) * (1.0 - 0.85 * outlet); }
   if (t < 1.6 && abs(uv.x) < 200.0) { h += shrineHill(uv); }
   // 自然地の細かな起伏（近くでは 0.3m の波長まで）
   h += 0.30 * fbm(p, 6, 11.0, minWl, 61u);
@@ -210,15 +214,16 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   // 畦や土手のような細い盛り上がりは、評価する足元（minWl）より細いと網目に拾われて
   // ぎざぎざになる。足元に合わせて幅を広げ、体積が変わらないよう高さを下げる。
   // 画素側は足元が小さいので本来の形で評価され、陰影は鮮明に出る。
-  // 盛り上がりがメッシュ間隔（≈ minWl/2）の 3〜4 倍にまたがるまで広げる
-  let widen = max(1.0, minWl * 1.75 / 0.8);
+  // 盛り上がりがメッシュ間隔（≈ minWl/2）の 5 倍にまたがるまで広げる。高さは変えない
+  // （両側で頂の高さを一致させないと、畦の線上に段差が出て中距離で歯のように見える）
+  let widen = max(1.0, minWl * 2.5 / 0.8);
 
   if (t < 1.05) {
     let c = resolveCell(uv);
     if (c.isPaddy) {
       let mud = c.level - 0.12;
       let crest = floorH + 0.42 + 0.06 * gnoise(p / 1.5, 71u);
-      let ridge = mud + (crest - mud) / widen * (1.0 - smootherstep(0.0, 0.8 * widen, c.ridgeDist));
+      let ridge = mud + (crest - mud) * (1.0 - smootherstep(0.0, 0.8 * widen, c.ridgeDist));
       h = max(mud, ridge);
       s.kind = select(KIND_RIDGE, KIND_MUD, c.ridgeDist > 0.75);
       s.wet = select(0.0, 1.0, c.ridgeDist > 0.75);

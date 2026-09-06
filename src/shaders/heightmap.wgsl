@@ -21,3 +21,24 @@ fn fillLevel(@builtin(global_invocation_id) id: vec3u) {
   let h = terrainHeight(p, level.texel * 2.0);
   textureStore(outHeight, vec2i(i32(id.x), i32(id.y)), i32(layer), vec4f(h, 0.0, 0.0, 0.0));
 }
+
+// ---- 法線と日向/日陰の焼き込み ----
+// 高さテクスチャ（group 1）を読んで、法線（rg16float: x,z）と太陽の可視度（r8unorm）を段ごとに書く。
+// 画素側はそれぞれ 1 タップで済む。太陽は固定なので影は起動時の 1 回でよい。
+
+@group(2) @binding(0) var<uniform> bakeLayer: u32;
+// rg16float / r8unorm は storage 書き込み非対応（検証エラーで判明）。rgba16float 1 枚に
+// 法線 xz と太陽の可視度をまとめる
+@group(2) @binding(1) var outLight: texture_storage_2d_array<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn bakeNormalShadow(@builtin(global_invocation_id) id: vec3u) {
+  let lv = hmLevels.l[i32(bakeLayer)];
+  let n = u32(lv.w);
+  if (id.x >= n || id.y >= n) { return; }
+  let p = lv.xy + (vec2f(f32(id.x), f32(id.y)) + 0.5) * lv.z;
+  let nrm = sampleNormal(p, lv.z);
+  let h = sampleHeight(i32(bakeLayer), p);
+  let shade = terrainShadow(vec3f(p.x, h, p.y), frame.sunDir.xyz);
+  textureStore(outLight, vec2i(id.xy), i32(bakeLayer), vec4f(nrm.x, nrm.z, shade, 0.0));
+}

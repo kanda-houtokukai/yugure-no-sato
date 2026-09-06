@@ -59,21 +59,24 @@ fn fs(in: VSOut) -> FSOut {
 
   // 材質は数式を画素ごとに 1 回だけ評価（これは軽い）。法線は焼いた高さテクスチャから
   let s = terrainSurface(p, minWl);
-  let n = sampleNormal(p, pixelSize);
+  // 法線と日向/日陰は焼いたもの 1 タップ（計測用 dbg=7: 双三次で直接計算、dbg=8: 影を行進で直接計算）
+  let baked = bakedLight(p);
+  let n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);
 
   let albedo = terrainAlbedo(p, s);
   let sun = frame.sunDir.xyz;
   let ndl = max(dot(n, sun), 0.0);
 
-  // 仮の光（次の段階で大気散乱に置き換える）
-  let sunColor = vec3f(1.0, 0.62, 0.36) * 4.0;
-  let skyAmbient = vec3f(0.30, 0.40, 0.65) * (0.55 + 0.45 * n.y) * 0.5;
-  var color = albedo * (ndl * sunColor + skyAmbient);
+  // 太陽光: 大気を抜けてきた色 × 地形の影
+  let sunLight = SUN_E * sunTransmittance(toPlanet(in.world), sun, 6);
+  // 日向/日陰は焼いたもの 1 タップ（計測用 dbg=8: 行進で直接計算）
+  let shadow = select(baked.shadow, terrainShadow(in.world, sun), dbg == 8.0);
+  let ambient = skyAmbient(n);
+  var color = albedo * (ndl * shadow * sunLight + ambient);
 
-  // 仮の距離霞
-  let fog = 1.0 - exp(-dist * 0.00035);
-  let fogColor = vec3f(0.85, 0.55, 0.35);
-  color = mix(color, fogColor, fog);
+  // 遠景の溶け込み: 視線上の散乱と透過
+  let air = atmosphereMarch(frame.camPos.xyz, -viewDir, sun, dist, 6, 2);
+  color = color * air.transmittance + air.inscatter;
 
   // デバッグ表示: params.w == 1 で法線、2 で材質種別、3 で高さ
   if (dbg == 1.0) { color = n * 0.5 + 0.5; }

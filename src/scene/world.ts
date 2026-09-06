@@ -11,6 +11,10 @@ import tonemapWgsl from '../shaders/tonemap.wgsl?raw';
 import queryWgsl from '../shaders/query.wgsl?raw';
 import heightmapWgsl from '../shaders/heightmap.wgsl?raw';
 import heightsampleWgsl from '../shaders/heightsample.wgsl?raw';
+import atmosphereWgsl from '../shaders/atmosphere.wgsl?raw';
+import skylutWgsl from '../shaders/skylut.wgsl?raw';
+import shadowWgsl from '../shaders/shadow.wgsl?raw';
+import lightsampleWgsl from '../shaders/lightsample.wgsl?raw';
 
 import type { DeviceBundle } from '../gpu/device';
 import type { FrameContext, SceneRenderer, ShaderMessage } from '../harness/runner';
@@ -36,12 +40,16 @@ const FRAME_FLOATS = 48;
 
 /**
  * 高さテクスチャの段構成。近・中・遠の 3 段、各 2048² の r32float（合計 48MB）。
- * テクセルは 0.2m / 1.6m / 12.8m（8 倍ずつ）。いずれもリング中心（カメラ xz）を中心に置く。
+ * テクセルは 0.25m / 1.6m / 12.8m。近景段だけ視線の 100m 前方を中心に置き、見えている範囲を多く覆う。
  * 画素ごとの法線はここから取る。数式を画素ごとに複数回評価すると GPU の占有率が崖を越えて
  * 30ms 以上かかる（実測）ため、評価は焼く時の 1 回に集約する。
  */
 const HM_SIZE = 2048;
-const HM_TEXELS = [0.2, 1.6, 12.8] as const;
+const HM_TEXELS = [0.25, 1.6, 12.8] as const;
+
+/** 空の LUT（正距円筒）。空の描画・環境光・映り込みに使う。太陽が固定なので起動時に 1 回焼く */
+const SKY_LUT_W = 512;
+const SKY_LUT_H = 256;
 
 function buildRingIndices(rings: number, sectors: number): Uint32Array {
   const fan = sectors * 3;
@@ -86,9 +94,25 @@ export class WorldScene implements SceneRenderer {
   private heightTex!: GPUTexture;
   private heightBindGroup!: GPUBindGroup;
   private heightBakeMs = 0;
+  private skyLutTex!: GPUTexture;
+  private skyLutPipeline!: GPUComputePipeline;
+  private skyLutBakeBindGroup!: GPUBindGroup;
+  private skyLutBindGroup!: GPUBindGroup;
+  private skyReducePipeline!: GPUComputePipeline;
+  private skyReduceBindGroup!: GPUBindGroup;
+  private skyIrrBuffer!: GPUBuffer;
+  private lightTex!: GPUTexture;
+  private lightBindGroup!: GPUBindGroup;
+  private lightBakeMs = 0;
 
   /** 起動時に GPU へ問い合わせて確定した値（レポート用） */
-  private resolved = { eyeGroundHeight: 0, eye: [0, 0, 0] as Vec3, sunDir: [0, 0, 0] as Vec3 };
+  private resolved = {
+    eyeGroundHeight: 0,
+    eye: [0, 0, 0] as Vec3,
+    sunDir: [0, 0, 0] as Vec3,
+    /** 空の放射照度（上向き面）・全天平均放射輝度・直射（太陽に正対する面）。露出の判断材料 */
+    light: { skyIrradianceUp: [0, 0, 0] as Vec3, skyMeanRadiance: [0, 0, 0] as Vec3, sunIrradiance: [0, 0, 0] as Vec3 },
+  };
 
   constructor(view: View) {
     this.view = view;
@@ -109,9 +133,12 @@ export class WorldScene implements SceneRenderer {
 
     const worldCode = commonWgsl + noiseWgsl + worldWgsl;
     const queryModule = await this.makeModule('query', worldCode + queryWgsl);
-    const terrainModule = await this.makeModule('terrain', worldCode + frameWgsl + heightsampleWgsl + terrainWgsl);
-    const heightmapModule = await this.makeModule('heightmap', worldCode + heightmapWgsl);
-    const skyModule = await this.makeModule('sky', commonWgsl + noiseWgsl + frameWgsl + skyWgsl);
+    const terrainModule = await this.makeModule(
+      'terrain',
+      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
+    );
+    const heightmapModule = await this.makeModule('heightmap', worldCode + frameWgsl + heightsampleWgsl + shadowWgsl + heightmapWgsl);
+    const skyModule = await this.makeModule('sky', commonWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + skyWgsl);
     const tonemapModule = await this.makeModule('tonemap', commonWgsl + frameWgsl.replace('@group(0) @binding(0) var<uniform> frame: Frame;', '') + tonemapWgsl);
 
     // --- 視点の地面高さを正本（world.wgsl）に問い合わせる ---
@@ -119,7 +146,8 @@ export class WorldScene implements SceneRenderer {
     this.resolved.eyeGroundHeight = eyeGround;
 
     // --- 高さテクスチャを焼く（リング中心 = 視点 xz） ---
-    const heightLayout = await this.bakeHeightmaps(heightmapModule, [this.view.eye.x, this.view.eye.z]);
+    const fwd = dirFromAzEl(this.view.yawDeg, 0);
+    const heightLayout = await this.bakeHeightmaps(heightmapModule, [this.view.eye.x, this.view.eye.z], [fwd[0] * 100, fwd[2] * 100]);
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -140,6 +168,69 @@ export class WorldScene implements SceneRenderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
 
+    // --- 空の LUT ---
+    this.skyLutTex = device.createTexture({
+      size: [SKY_LUT_W, SKY_LUT_H],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const skyLutBakeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+      ],
+    });
+    this.skyLutPipeline = device.createComputePipeline({
+      label: 'bakeSkyLut',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [skyLutBakeLayout] }),
+      compute: { module: skyModule, entryPoint: 'bakeSkyLut' },
+    });
+    this.skyLutBakeBindGroup = device.createBindGroup({
+      layout: skyLutBakeLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameBuffer } },
+        { binding: 1, resource: this.skyLutTex.createView() },
+      ],
+    });
+    // LUT の半球積分（環境光）
+    this.skyIrrBuffer = device.createBuffer({ size: 48, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const skyReduceLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    this.skyReducePipeline = device.createComputePipeline({
+      label: 'reduceSkyLut',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [skyReduceLayout] }),
+      compute: { module: skyModule, entryPoint: 'reduceSkyLut' },
+    });
+    this.skyReduceBindGroup = device.createBindGroup({
+      layout: skyReduceLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameBuffer } },
+        { binding: 2, resource: this.skyLutTex.createView() },
+        { binding: 3, resource: { buffer: this.skyIrrBuffer } },
+      ],
+    });
+
+    const skyLutLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      ],
+    });
+    this.skyLutBindGroup = device.createBindGroup({
+      layout: skyLutLayout,
+      entries: [
+        { binding: 0, resource: this.skyLutTex.createView() },
+        { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge' }) },
+        { binding: 2, resource: { buffer: this.skyIrrBuffer } },
+      ],
+    });
+
     // --- リングメッシュのインデックス ---
     const indices = buildRingIndices(RING_COUNT, RING_SECTORS);
     this.indexCount = indices.length;
@@ -151,14 +242,15 @@ export class WorldScene implements SceneRenderer {
 
     // --- パイプライン ---
     const frameLayout = device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
     });
     this.frameBindGroup = device.createBindGroup({
       layout: frameLayout,
       entries: [{ binding: 0, resource: { buffer: this.frameBuffer } }],
     });
-    const frameOnly = device.createPipelineLayout({ bindGroupLayouts: [frameLayout] });
-    const frameAndHeight = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout] });
+    // 法線・日向/日陰の焼き込み（高さテクスチャと太陽が確定してから）
+    const lightLayout = await this.bakeNormalShadow(heightmapModule, frameLayout, heightLayout);
+    const frameAndHeight = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout, lightLayout] });
 
     this.terrainPipeline = device.createRenderPipeline({
       label: 'terrain',
@@ -170,7 +262,7 @@ export class WorldScene implements SceneRenderer {
     });
     this.skyPipeline = device.createRenderPipeline({
       label: 'sky',
-      layout: frameOnly,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, skyLutLayout] }),
       vertex: { module: skyModule, entryPoint: 'vs' },
       fragment: { module: skyModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
@@ -197,13 +289,40 @@ export class WorldScene implements SceneRenderer {
         { binding: 1, resource: this.hdr.createView() },
       ],
     });
+
+    // --- 光の数値を 1 回読み戻す（診断・露出の判断材料） ---
+    {
+      const encoder = device.createCommandEncoder();
+      const lut = encoder.beginComputePass();
+      lut.setPipeline(this.skyLutPipeline);
+      lut.setBindGroup(0, this.skyLutBakeBindGroup);
+      lut.dispatchWorkgroups(SKY_LUT_W / 8, SKY_LUT_H / 8);
+      lut.end();
+      const reduce = encoder.beginComputePass();
+      reduce.setPipeline(this.skyReducePipeline);
+      reduce.setBindGroup(0, this.skyReduceBindGroup);
+      reduce.dispatchWorkgroups(1);
+      reduce.end();
+      const read = device.createBuffer({ size: 48, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      encoder.copyBufferToBuffer(this.skyIrrBuffer, 0, read, 0, 48);
+      device.queue.submit([encoder.finish()]);
+      await read.mapAsync(GPUMapMode.READ);
+      const v = new Float32Array(read.getMappedRange().slice(0));
+      read.unmap();
+      read.destroy();
+      this.resolved.light = {
+        skyIrradianceUp: [v[0], v[1], v[2]],
+        skyMeanRadiance: [v[4], v[5], v[6]],
+        sunIrradiance: [v[8], v[9], v[10]],
+      };
+    }
   }
 
   /**
    * 高さテクスチャを compute で焼く。段ごとに原点をテクセル格子に揃える（後で視点が動いたとき
    * 揺れないため）。戻り値は描画側の bind group layout（group 1）。
    */
-  private async bakeHeightmaps(module: GPUShaderModule, center: [number, number]): Promise<GPUBindGroupLayout> {
+  private async bakeHeightmaps(module: GPUShaderModule, center: [number, number], l0Offset: [number, number]): Promise<GPUBindGroupLayout> {
     const device = this.device;
     const t0 = performance.now();
     this.heightTex = device.createTexture({
@@ -223,8 +342,10 @@ export class WorldScene implements SceneRenderer {
     const scratch: GPUBuffer[] = [];
     HM_TEXELS.forEach((texel, i) => {
       const extent = texel * HM_SIZE;
-      const ox = Math.floor((center[0] - extent / 2) / texel) * texel;
-      const oz = Math.floor((center[1] - extent / 2) / texel) * texel;
+      const cx = center[0] + (i === 0 ? l0Offset[0] : 0);
+      const cz = center[1] + (i === 0 ? l0Offset[1] : 0);
+      const ox = Math.floor((cx - extent / 2) / texel) * texel;
+      const oz = Math.floor((cz - extent / 2) / texel) * texel;
       levelParams.set([ox, oz, texel, HM_SIZE], i * 4);
 
       const paramBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -256,9 +377,9 @@ export class WorldScene implements SceneRenderer {
     device.queue.writeBuffer(levelsBuf, 0, levelParams);
     const layout = device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, sampler: { type: 'filtering' } },
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
       ],
     });
     this.heightBindGroup = device.createBindGroup({
@@ -268,6 +389,63 @@ export class WorldScene implements SceneRenderer {
         { binding: 1, resource: this.heightTex.createView({ dimension: '2d-array' }) },
         { binding: 2, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
       ],
+    });
+    return layout;
+  }
+
+  /** 焼いた高さから法線と日向/日陰を段ごとに焼く。画素側は 1 タップで読む */
+  private async bakeNormalShadow(module: GPUShaderModule, frameLayout: GPUBindGroupLayout, heightLayout: GPUBindGroupLayout): Promise<GPUBindGroupLayout> {
+    const device = this.device;
+    const t0 = performance.now();
+    const layers = HM_TEXELS.length;
+    // rg16float / r8unorm は storage 書き込み非対応。rgba16float 1 枚に法線 xz と可視度をまとめる
+    this.lightTex = device.createTexture({
+      size: [HM_SIZE, HM_SIZE, layers], format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const bakeLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '2d-array' } },
+      ],
+    });
+    const pipeline = device.createComputePipeline({
+      label: 'bakeNormalShadow',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, bakeLayout] }),
+      compute: { module, entryPoint: 'bakeNormalShadow' },
+    });
+    const encoder = device.createCommandEncoder();
+    const scratch: GPUBuffer[] = [];
+    for (let i = 0; i < layers; i++) {
+      const layerBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(layerBuf, 0, new Uint32Array([i, 0, 0, 0]));
+      scratch.push(layerBuf);
+      const bg = device.createBindGroup({
+        layout: bakeLayout,
+        entries: [
+          { binding: 0, resource: { buffer: layerBuf } },
+          { binding: 1, resource: this.lightTex.createView({ dimension: '2d-array' }) },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.frameBindGroup);
+      pass.setBindGroup(1, this.heightBindGroup);
+      pass.setBindGroup(2, bg);
+      pass.dispatchWorkgroups(HM_SIZE / 8, HM_SIZE / 8);
+      pass.end();
+    }
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    this.lightBakeMs = performance.now() - t0;
+    for (const b of scratch) b.destroy();
+
+    const layout = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } }],
+    });
+    this.lightBindGroup = device.createBindGroup({
+      layout,
+      entries: [{ binding: 0, resource: this.lightTex.createView({ dimension: '2d-array' }) }],
     });
     return layout;
   }
@@ -340,7 +518,7 @@ export class WorldScene implements SceneRenderer {
     const hdrView = this.hdr.createView();
     const depthView = this.depth.createView();
 
-    // 1. 地形（HDR へ。深度は逆 Z で 0 クリア）
+    // 1. 地形（HDR へ。深度は逆 Z で 0 クリア）。空の LUT は起動時に焼いてある
     const terrain = encoder.beginRenderPass({
       colorAttachments: [{ view: hdrView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
       depthStencilAttachment: { view: depthView, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' },
@@ -349,6 +527,8 @@ export class WorldScene implements SceneRenderer {
     terrain.setPipeline(this.terrainPipeline);
     terrain.setBindGroup(0, this.frameBindGroup);
     terrain.setBindGroup(1, this.heightBindGroup);
+    terrain.setBindGroup(2, this.skyLutBindGroup);
+    terrain.setBindGroup(3, this.lightBindGroup);
     terrain.setIndexBuffer(this.indexBuffer, 'uint32');
     terrain.drawIndexed(this.indexCount);
     terrain.end();
@@ -360,6 +540,8 @@ export class WorldScene implements SceneRenderer {
     });
     sky.setPipeline(this.skyPipeline);
     sky.setBindGroup(0, this.frameBindGroup);
+    sky.setBindGroup(1, this.heightBindGroup);
+    sky.setBindGroup(2, this.skyLutBindGroup);
     sky.draw(3);
     sky.end();
 
@@ -378,7 +560,7 @@ export class WorldScene implements SceneRenderer {
     return {
       view: this.view,
       resolved: this.resolved,
-      heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs },
+      heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
       ring: {
         sectors: RING_SECTORS,
         rings: RING_COUNT,
