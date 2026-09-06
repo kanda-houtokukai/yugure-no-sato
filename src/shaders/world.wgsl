@@ -149,24 +149,37 @@ fn resolveCell(uv: vec2f) -> Cell {
 // ---------- あぜ道 ----------
 struct PathHit { dist: f32, halfWidth: f32, top: f32, on: bool };
 
-/** 主要な一本（縦線 0 に沿って集落側＝南から神社側＝北へ）と、横に走る副道 2 本 */
+/**
+ * あぜ道の網目。区画の線に沿って通す（畦そのものを踏み固めた道）。
+ * - 主道: 縦線 0 に沿って集落側（南）から神社の丘（北）へ抜ける一本。川は浅瀬で渡る（橋はフェーズ2）
+ * - 副道: 横線 4 と -3 に沿って谷を東西に走る 2 本
+ * - 枝道: 縦線 -4 と 5 に沿って副道と主道をつなぐ 2 本
+ */
+fn considerPath(best: ptr<function, PathHit>, d: f32, halfWidth: f32, top: f32) {
+  if (d < (*best).dist) { (*best).dist = d; (*best).halfWidth = halfWidth; (*best).top = top; }
+}
+
 fn nearestPath(uv: vec2f, floorH: f32) -> PathHit {
   var best: PathHit;
   best.dist = 1e9; best.halfWidth = 1.1; best.top = floorH + 0.55; best.on = false;
 
   // 主道
   if (uv.y > -190.0 && uv.y < 225.0) {
-    let d = abs(uv.x - lineB(0, uv.y));
-    if (d < best.dist) { best.dist = d; best.halfWidth = 1.1; best.top = floorH + 0.55; }
+    considerPath(&best, abs(uv.x - lineB(0, uv.y)), 1.1, floorH + 0.55);
   }
   // 副道（横線 4 と -3 に沿う）
   if (uv.x > -210.0 && uv.x < 170.0) {
-    let d = abs(uv.y - lineA(4, uv.x));
-    if (d < best.dist) { best.dist = d; best.halfWidth = 0.8; best.top = floorH + 0.45; }
+    considerPath(&best, abs(uv.y - lineA(4, uv.x)), 0.8, floorH + 0.45);
   }
   if (uv.x > -150.0 && uv.x < 230.0) {
-    let d = abs(uv.y - lineA(-3, uv.x));
-    if (d < best.dist) { best.dist = d; best.halfWidth = 0.8; best.top = floorH + 0.45; }
+    considerPath(&best, abs(uv.y - lineA(-3, uv.x)), 0.8, floorH + 0.45);
+  }
+  // 枝道（縦線 -4 と 5 に沿う。川の帯は跨がない）
+  if (uv.y > -110.0 && uv.y < -RIVER_BAND + 1.0) {
+    considerPath(&best, abs(uv.x - lineB(-4, uv.y)), 0.7, floorH + 0.42);
+  }
+  if (uv.y > RIVER_BAND - 1.0 && uv.y < 150.0) {
+    considerPath(&best, abs(uv.x - lineB(5, uv.y)), 0.7, floorH + 0.42);
   }
   best.on = best.dist < best.halfWidth;
   return best;
