@@ -16,6 +16,7 @@ export interface DeviceBundle {
   format: GPUTextureFormat;
   /** timestamp-query が使えるか。使えなければ GPU 側のフレーム時間は取れない */
   hasTimestampQuery: boolean;
+  hasFloat32Filterable: boolean;
   /** 発生した GPU エラーの集積先。呼び出し側はこの配列を読む */
   errors: GpuErrorRecord[];
 }
@@ -49,9 +50,12 @@ export async function acquireDevice(): Promise<DeviceBundle> {
   if (!adapter) throw new Error('requestAdapter が null（利用可能なアダプタなし）');
 
   const hasTimestampQuery = adapter.features.has('timestamp-query');
-  const device = await adapter.requestDevice({
-    requiredFeatures: hasTimestampQuery ? ['timestamp-query'] : [],
-  });
+  // r32float の高さテクスチャを線形補間で読むために要る（この Mac では利用可を実証済み）
+  const hasFloat32Filterable = adapter.features.has('float32-filterable');
+  const requiredFeatures: GPUFeatureName[] = [];
+  if (hasTimestampQuery) requiredFeatures.push('timestamp-query');
+  if (hasFloat32Filterable) requiredFeatures.push('float32-filterable');
+  const device = await adapter.requestDevice({ requiredFeatures });
 
   const errors: GpuErrorRecord[] = [];
 
@@ -79,6 +83,7 @@ export async function acquireDevice(): Promise<DeviceBundle> {
     device,
     format: navigator.gpu.getPreferredCanvasFormat(),
     hasTimestampQuery,
+    hasFloat32Filterable,
     errors,
   };
 }

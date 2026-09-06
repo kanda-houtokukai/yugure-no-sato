@@ -5,7 +5,8 @@
 // Playwright 同梱の Chromium ではなく channel:'chrome' で実機の Chrome 安定版を起動する。
 // 理由: tools/probe.mjs で WebGPU の動作を実証したのがその Chrome だから。
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { ROOT, startVite, stamp, waitForServer } from './dev-server.mjs';
@@ -13,7 +14,7 @@ import { ROOT, startVite, stamp, waitForServer } from './dev-server.mjs';
 const PORT = 5198;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const OUT_DIR = join(ROOT, '.screenshots');
-const VIEWS = ['front', 'bird', 'ground'];
+const VIEWS = ['front', 'bird', 'ground', 'water'];
 const PAGE_TIMEOUT_MS = 60000;
 
 async function captureView(browser, view, at) {
@@ -42,6 +43,7 @@ async function captureView(browser, view, at) {
   let report = null;
   let failure = null;
   let screenshot = null;
+  let sha256 = null;
 
   try {
     await page.goto(url, { waitUntil: 'load', timeout: PAGE_TIMEOUT_MS });
@@ -56,6 +58,7 @@ async function captureView(browser, view, at) {
 
     screenshot = join(OUT_DIR, `${at}-${view}.png`);
     await page.locator('#view').screenshot({ path: screenshot });
+    sha256 = createHash('sha256').update(readFileSync(screenshot)).digest('hex');
   } catch (e) {
     failure = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
   } finally {
@@ -66,6 +69,7 @@ async function captureView(browser, view, at) {
     view,
     url,
     screenshot,
+    sha256,
     harnessError: failure,
     consoleErrors,
     httpErrors,
@@ -134,6 +138,7 @@ async function main() {
     for (const c of r.report?.checks ?? []) {
       console.log(`   ${c.ok ? '○' : '×'} ${c.name} — ${c.detail}`);
     }
+    if (r.sha256) console.log(`   sha256: ${r.sha256}`);
     if (r.report?.error) console.log(`   ページ内エラー: ${r.report.error}`);
   }
   console.log(`\nスクショ: ${OUT_DIR}`);

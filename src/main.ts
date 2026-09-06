@@ -1,6 +1,7 @@
 import { probeWebGPU } from './gpu/probe';
 import { postToSink } from './sink';
-import { runScratchScene } from './scene/scratch';
+import { runScene } from './harness/runner';
+import { WorldScene } from './scene/world';
 import { viewFromUrl } from './views';
 import { evaluateChecks, type Check } from './selfcheck';
 
@@ -31,14 +32,7 @@ declare global {
 const params = new URLSearchParams(location.search);
 const mode = params.get('mode') === 'probe' ? 'probe' : 'scene';
 
-window.__yugure = {
-  mode,
-  probeDone: false,
-  probe: null,
-  firstFrameDone: false,
-  sceneDone: false,
-  report: null,
-};
+window.__yugure = { mode, probeDone: false, probe: null, firstFrameDone: false, sceneDone: false, report: null };
 
 function status(text: string): void {
   const el = document.getElementById('out');
@@ -48,46 +42,38 @@ function status(text: string): void {
 async function runProbe(): Promise<void> {
   status('WebGPU を確認中…');
   const report = await probeWebGPU();
-  if (report.ok) {
-    console.log('[probe] WebGPU OK', report.adapter?.info);
-  } else {
-    console.error('[probe] WebGPU NG at', report.stage, report.error);
-  }
+  if (report.ok) console.log('[probe] WebGPU OK', report.adapter?.info);
+  else console.error('[probe] WebGPU NG at', report.stage, report.error);
   status(JSON.stringify(report, null, 2));
   window.__yugure.probe = report;
   window.__yugure.probeDone = true;
   await postToSink('probe', report);
 }
 
-async function runScene(): Promise<void> {
+async function runView(): Promise<void> {
   const view = viewFromUrl(location.search);
   status(`視点 ${view.name} を描画中…`);
-
   const canvas = document.getElementById('view');
   if (!(canvas instanceof HTMLCanvasElement)) throw new Error('#view キャンバスが無い');
 
   let report: ViewReport;
   try {
-    const scene = await runScratchScene(canvas, view, () => {
+    const result = await runScene(canvas, new WorldScene(view), () => {
       window.__yugure.firstFrameDone = true;
     });
     const checks = evaluateChecks({
-      image: scene.image,
-      gpuErrors: scene.gpuErrors,
-      shaderErrors: scene.shaderErrors,
-      framesRendered: scene.framesRendered,
-      framesExpected: scene.framesExpected,
-      timedOut: scene.timedOut,
-      gpu: scene.gpu,
-      cpu: scene.cpu,
+      image: result.image,
+      gpuErrors: result.gpuErrors,
+      shaderErrors: result.shaderErrors,
+      framesRendered: result.framesRendered,
+      framesExpected: result.framesExpected,
+      timedOut: result.timedOut,
+      gpu: result.gpu,
+      cpu: result.cpu,
     });
-    report = {
-      view: view.name,
-      ok: checks.every((c) => c.ok),
-      checks,
-      error: null,
-      scene,
-    };
+    // 生の画素はレポートに載せない（大きすぎる）
+    const { pixels: _pixels, ...rest } = result;
+    report = { view: view.name, ok: checks.every((c) => c.ok), checks, error: null, scene: rest };
   } catch (e) {
     report = {
       view: view.name,
@@ -104,11 +90,9 @@ async function runScene(): Promise<void> {
       (report.error ?? report.checks.map((c) => `${c.ok ? '○' : '×'} ${c.name} — ${c.detail}`).join('\n')),
   );
   window.__yugure.report = report;
-  // sink への送出を終えてから旗を立てる。先に立てるとハーネスがページを閉じにかかり、
-  // 送出中の POST が net::ERR_ABORTED になって偽の異常として報告される
+  // sink への送出を終えてから旗を立てる（先に立てると送出中の POST が中断され偽の異常になる）
   await postToSink(`scene-${view.name}`, report);
-  // 旗は必ず最後に。失敗した場合も立てて、ハーネスを待たせて固めない
   window.__yugure.sceneDone = true;
 }
 
-void (mode === 'probe' ? runProbe() : runScene());
+void (mode === 'probe' ? runProbe() : runView());
