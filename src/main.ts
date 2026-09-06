@@ -45,8 +45,9 @@ declare global {
 }
 
 const params = new URLSearchParams(location.search);
+// 既定は実操作モード。URL を開いた人がそのまま歩ける（検証系は mode=scene を明示する）
 const modeRaw = params.get('mode');
-const mode = modeRaw === 'probe' ? 'probe' : modeRaw === 'play' ? 'play' : 'scene';
+const mode = modeRaw === 'probe' ? 'probe' : modeRaw === 'scene' ? 'scene' : 'play';
 
 window.__yugure = { mode, probeDone: false, probe: null, firstFrameDone: false, sceneDone: false, report: null };
 
@@ -149,8 +150,7 @@ async function runLive(): Promise<void> {
   const view = viewFromUrl(location.search);
   const canvas = document.getElementById('view');
   if (!(canvas instanceof HTMLCanvasElement)) throw new Error('#view キャンバスが無い');
-  status('起動中…');
-  await runPlay(canvas, new WorldScene(view), status);
+  await runPlay(canvas, new WorldScene(view));
 }
 
 void (mode === 'probe' ? runProbe() : mode === 'play' ? runLive() : runView());

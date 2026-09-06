@@ -42,7 +42,8 @@ async function captureView(browser, view, at, extraQuery = '', suffix = '') {
     httpErrors.push(`failed ${req.url()} (${req.failure()?.errorText ?? '理由不明'})`);
   });
 
-  const url = `${ORIGIN}/?view=${view}${extraQuery}`;
+  // mode=scene: 既定は実操作モードなので、検証では明示的に計測モードを指定する
+  const url = `${ORIGIN}/?mode=scene&view=${view}${extraQuery}`;
   let report = null;
   let failure = null;
   let screenshot = null;

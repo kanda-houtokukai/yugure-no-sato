@@ -23,7 +23,8 @@ const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
 
-await page.goto(`${ORIGIN}/?${query}`, { waitUntil: 'load' });
+// mode=scene: 既定は実操作モードなので、撮影では明示的に計測モードを指定する
+await page.goto(`${ORIGIN}/?mode=scene&${query}`, { waitUntil: 'load' });
 await page.waitForFunction(() => window.__yugure?.sceneDone === true, null, { timeout: 90000 });
 const report = await page.evaluate(() => window.__yugure.report);
 const path = join(OUT_DIR, `shot-${name}.png`);

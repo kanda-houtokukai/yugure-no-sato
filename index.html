@@ -6,18 +6,89 @@
     <!-- 素材ゼロの原則によりアイコンファイルは置かない。
          空の data URI にして favicon.ico の要求自体を無くす（無いと 404 が verify を汚す） -->
     <link rel="icon" href="data:," />
-    <title>夕暮れの里 — 検証用ハーネス</title>
+    <title>夕暮れの里</title>
     <style>
       html, body { margin: 0; background: #14161c; color: #d8dbe2; }
       body { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-      /* スクショはこのキャンバスだけを撮る。CSS サイズと解像度を一致させておく */
+      /* 検証モードではスクショはこのキャンバスだけを撮る。CSS サイズと解像度を一致させておく */
       #view { display: block; width: 1280px; height: 720px; }
       #out { white-space: pre-wrap; word-break: break-all; margin: 0; padding: 12px; }
+
+      /* ---- 実操作モード ---- */
+      body.playing { overflow: hidden; height: 100vh; display: grid; place-items: center; background: #0b0d12; }
+      body.playing #out { display: none; }
+      body.playing #view { cursor: grab; }
+      body.playing #view.dragging { cursor: grabbing; }
+
+      /* hidden 属性を必ず効かせる。作者スタイルで display を指定すると
+         UA の [hidden]{display:none} を上書きしてしまい、#guide が消えなくなる
+         （実測: 検証スクショに案内が写り込み、全視点のハッシュが変わった） */
+      [hidden] { display: none !important; }
+      #guide, #hint, #hud { position: fixed; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; }
+
+      /* 開いた直後の案内。操作を始めると消える */
+      #guide {
+        inset: 0; display: grid; place-items: center; z-index: 3;
+        /* backdrop-filter は使わない。非表示でもページが GPU 合成レイヤーに昇格し、
+           検証スクショの画素が変わることを実測（全視点のハッシュが変わった）。半透明の背景だけで足りる */
+        background: rgba(8, 10, 16, 0.62);
+        transition: opacity 420ms ease; opacity: 1;
+        /* 案内は見せるだけ。クリックもドラッグも下のキャンバスへ通す
+           （覆っていると「クリックしても何も起きない」ことになる） */
+        pointer-events: none;
+      }
+      #guide.hiding { opacity: 0; pointer-events: none; }
+      #guide .card {
+        background: rgba(18, 21, 28, 0.94); border: 1px solid rgba(220, 200, 150, 0.28);
+        border-radius: 14px; padding: 30px 38px; max-width: 560px;
+        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55); color: #e8e4da;
+      }
+      #guide h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: 0.04em; }
+      #guide .lead { margin: 0 0 20px; font-size: 15px; color: #f0d9a8; }
+      #guide dl { display: grid; grid-template-columns: auto 1fr; gap: 10px 18px; margin: 0; font-size: 14px; }
+      #guide dt { color: #a9b0bd; white-space: nowrap; }
+      #guide dd { margin: 0; }
+      #guide kbd {
+        display: inline-block; min-width: 1.5em; text-align: center;
+        padding: 2px 7px; margin: 0 2px; border-radius: 5px; font: inherit; font-size: 13px;
+        background: #2b3040; border: 1px solid #3d4455; border-bottom-width: 2px; color: #e8e4da;
+      }
+      #guide .foot { margin: 22px 0 0; font-size: 12px; color: #8b93a1; }
+
+      /* 操作中の最小限のヒント（隅） */
+      #hint {
+        right: 14px; bottom: 12px; z-index: 2; font-size: 12px; color: rgba(232, 228, 218, 0.62);
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); transition: opacity 300ms ease;
+      }
+      /* 数値。既定は非表示、H で出す */
+      #hud {
+        left: 14px; top: 12px; z-index: 2; margin: 0; font-size: 12px; line-height: 1.55;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+        color: rgba(232, 228, 218, 0.85); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+      }
     </style>
   </head>
   <body>
     <canvas id="view" width="1280" height="720"></canvas>
     <pre id="out">起動中…</pre>
+
+    <div id="guide" hidden>
+      <div class="card">
+        <h1>夕暮れの里</h1>
+        <p class="lead">画面をクリックすると、里を歩けます。</p>
+        <dl>
+          <dt>前へ進む／後ろへ</dt><dd><kbd>W</kbd> ／ <kbd>S</kbd></dd>
+          <dt>左へ／右へ</dt><dd><kbd>A</kbd> ／ <kbd>D</kbd></dd>
+          <dt>見回す</dt><dd>画面を<strong>押したまま動かす</strong>（<kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> でも回せます）</dd>
+          <dt>走る</dt><dd><kbd>Shift</kbd> を押しながら</dd>
+          <dt>数値を見る</dt><dd><kbd>H</kbd></dd>
+        </dl>
+        <p class="foot">田んぼやあぜ道を歩くと足あとが残り、しばらくすると元に戻ります。<br />この案内は、操作を始めると消えます。</p>
+      </div>
+    </div>
+    <div id="hint" hidden></div>
+    <pre id="hud" hidden></pre>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
