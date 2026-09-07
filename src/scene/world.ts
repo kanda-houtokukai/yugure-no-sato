@@ -91,6 +91,14 @@ const MSAA_SAMPLES = (() => { const v = Number(new URLSearchParams(location.sear
  */
 const HM_SIZE = 2048;
 const HM_TEXELS = [0.25, 1.6, 12.8] as const;
+// テクスチャの層は 4 枚。0 と 3 が近景段の交互の置き場、1・2 が中景・遠景。
+// 近景段は歩き手に追従して焼き直すので、焼いている間も絵が壊れないよう別の層へ書いて入れ替える
+const HM_LAYERS = 4;
+const HM_NEAR_ALT = 3;
+/** 近景段の中心から歩き手がこれだけ離れたら焼き直しを始める [m]（半径 256m のうち余裕 96m） */
+const NEAR_REBAKE_R = 160;
+/** 焼き直しを何フレームに分けるか。1 フレームで焼くと 50ms 級の飛びになる */
+const NEAR_REBAKE_BANDS = 16;
 
 /** 空の LUT（正距円筒）。空の描画・環境光・映り込みに使う。太陽が固定なので起動時に 1 回焼く */
 const SKY_LUT_W = 512;
@@ -149,6 +157,20 @@ function buildRingIndices(rings: number, sectors: number): Uint32Array {
     }
   }
   return out;
+}
+
+type L0 = { origin: [number, number]; texel: number; size: number; data: Float32Array };
+
+/** 近景段の CPU 複製を双線形で読む。段の外なら null */
+function sampleL0(l: L0, x: number, z: number): number | null {
+  const fx = (x - l.origin[0]) / l.texel - 0.5;
+  const fz = (z - l.origin[1]) / l.texel - 0.5;
+  const ix = Math.floor(fx), iz = Math.floor(fz);
+  if (ix < 0 || iz < 0 || ix >= l.size - 1 || iz >= l.size - 1) return null;
+  const tx = fx - ix, tz = fz - iz;
+  const d = l.data, n = l.size;
+  const h00 = d[iz * n + ix], h10 = d[iz * n + ix + 1], h01 = d[(iz + 1) * n + ix], h11 = d[(iz + 1) * n + ix + 1];
+  return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
 }
 
 export class WorldScene implements SceneRenderer {
@@ -265,6 +287,34 @@ export class WorldScene implements SceneRenderer {
   private l0: { origin: [number, number]; texel: number; size: number; data: Float32Array } | null = null;
   /** 焼いた材質の近景段（種別のみ）。人物の足元が水かの判定に使う */
   private matL0: Uint8Array | null = null;
+  /** 近景段の焼き直しの状態 */
+  private near = {
+    layer: 0,            // いま有効な層
+    origin: [0, 0] as [number, number],
+    /** 焼き直し中の行き先。null なら焼き直していない */
+    pending: null as null | { layer: number; origin: [number, number]; band: number },
+    rebakes: 0,
+    lastRebakeFrame: -1,
+    /** 近景段を入れ替えた瞬間の、新旧で同じ点を読んだ高さの差の最大 [m]。
+     *  0 でなければ、境界をまたぐ瞬間に地形が飛ぶということ */
+    swapDiffMax: 0,
+    swapSamples: 0,
+  };
+  private hmLevelParams = new Float32Array(4 * 4);
+  private hmLevelsBuf!: GPUBuffer;
+  private fillPipeline!: GPUComputePipeline;
+  private fillLayout!: GPUBindGroupLayout;
+  private lightPipeline!: GPUComputePipeline;
+  private lightLayout!: GPUBindGroupLayout;
+  private nearParamBuf!: GPUBuffer;
+  private nearLayerBuf!: GPUBuffer;
+  private nearBakeLayerBuf!: GPUBuffer;
+  private nearBakeLevelBuf!: GPUBuffer;
+  private nearHeightRead!: GPUBuffer;
+  private nearMatRead!: GPUBuffer;
+  private nearReadBusy = false;
+  /** 読み戻しを予約した近景段。encoder を submit した「あと」でないと map できない */
+  private nearReadPending: null | { origin: [number, number] } = null;
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -907,19 +957,27 @@ export class WorldScene implements SceneRenderer {
     const device = this.device;
     const t0 = performance.now();
     this.heightTex = device.createTexture({
-      size: [HM_SIZE, HM_SIZE, HM_TEXELS.length],
+      size: [HM_SIZE, HM_SIZE, HM_LAYERS],
       format: 'r32float',
       // COPY_SRC: 近景段を CPU に読み戻す（歩き手の足元）
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
+    this.fillLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'r32float', access: 'write-only', viewDimension: '2d-array' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    });
     const pipeline = device.createComputePipeline({
       label: 'fillLevel',
-      layout: 'auto',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.fillLayout] }),
       compute: { module, entryPoint: 'fillLevel' },
     });
+    this.fillPipeline = pipeline;
 
-    const levelParams = new Float32Array(4 * HM_TEXELS.length);
+    const levelParams = this.hmLevelParams;
     const encoder = device.createCommandEncoder();
     const scratch: GPUBuffer[] = [];
     HM_TEXELS.forEach((texel, i) => {
@@ -937,7 +995,7 @@ export class WorldScene implements SceneRenderer {
       scratch.push(paramBuf, layerBuf);
 
       const bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
+        layout: this.fillLayout,
         entries: [
           { binding: 0, resource: { buffer: paramBuf } },
           { binding: 1, resource: this.heightTex.createView({ dimension: '2d-array' }) },
@@ -950,7 +1008,11 @@ export class WorldScene implements SceneRenderer {
       pass.dispatchWorkgroups(HM_SIZE / 8, HM_SIZE / 8);
       pass.end();
     });
-    // 近景段（L0）を CPU に読み戻す（歩き手の足元の高さ用）。2048² × 4B = 16MB、1 回きり
+    // l[3].x = 近景段が入っている層。起動時は 0
+    levelParams.set([0, 0, 0, 0], 12);
+    this.near.layer = 0;
+    this.near.origin = [levelParams[0] + (HM_TEXELS[0] * HM_SIZE) / 2, levelParams[1] + (HM_TEXELS[0] * HM_SIZE) / 2];
+    // 近景段（L0）を CPU に読み戻す（歩き手の足元の高さ用）。2048² × 4B = 16MB
     const l0Bytes = HM_SIZE * HM_SIZE * 4;
     const l0Read = device.createBuffer({ size: l0Bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     encoder.copyTextureToBuffer(
@@ -969,6 +1031,14 @@ export class WorldScene implements SceneRenderer {
 
     const levelsBuf = device.createBuffer({ size: levelParams.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(levelsBuf, 0, levelParams);
+    this.hmLevelsBuf = levelsBuf;
+    // 焼き直しで使い回す小さなバッファ（毎回作ると GC を叩く）
+    this.nearParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.nearLayerBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.nearBakeLayerBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.nearBakeLevelBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.nearHeightRead = device.createBuffer({ size: HM_SIZE * HM_SIZE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    this.nearMatRead = device.createBuffer({ size: HM_SIZE * HM_SIZE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const layout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
@@ -1042,11 +1112,11 @@ export class WorldScene implements SceneRenderer {
     const layers = HM_TEXELS.length;
     // rg16float / r8unorm は storage 書き込み非対応。rgba16float 1 枚に法線 xz と可視度をまとめる
     this.lightTex = device.createTexture({
-      size: [HM_SIZE, HM_SIZE, layers], format: 'rgba16float',
+      size: [HM_SIZE, HM_SIZE, HM_LAYERS], format: 'rgba16float',
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.matTex = device.createTexture({
-      size: [HM_SIZE, HM_SIZE, layers], format: 'rgba8unorm',
+      size: [HM_SIZE, HM_SIZE, HM_LAYERS], format: 'rgba8unorm',
       // COPY_SRC: 近景段を CPU に読み戻す（人物の足元が水かの判定）
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
@@ -1055,25 +1125,31 @@ export class WorldScene implements SceneRenderer {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '2d-array' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba8unorm', access: 'write-only', viewDimension: '2d-array' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       ],
     });
+    this.lightLayout = bakeLayout;
     const pipeline = device.createComputePipeline({
       label: 'bakeNormalShadow',
       layout: device.createPipelineLayout({ bindGroupLayouts: [frameLayout, heightLayout, bakeLayout] }),
       compute: { module, entryPoint: 'bakeNormalShadow' },
     });
+    this.lightPipeline = pipeline;
     const encoder = device.createCommandEncoder();
     const scratch: GPUBuffer[] = [];
     for (let i = 0; i < layers; i++) {
       const layerBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(layerBuf, 0, new Uint32Array([i, 0, 0, 0]));
-      scratch.push(layerBuf);
+      device.queue.writeBuffer(layerBuf, 0, new Uint32Array([i, 0, i, 0]));   // w=0: 起動時の経路
+      const lvBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(lvBuf, 0, this.hmLevelParams.slice(i * 4, i * 4 + 4));
+      scratch.push(layerBuf, lvBuf);
       const bg = device.createBindGroup({
         layout: bakeLayout,
         entries: [
           { binding: 0, resource: { buffer: layerBuf } },
           { binding: 1, resource: this.lightTex.createView({ dimension: '2d-array' }) },
           { binding: 2, resource: this.matTex.createView({ dimension: '2d-array' }) },
+          { binding: 3, resource: { buffer: lvBuf } },
         ],
       });
       const pass = encoder.beginComputePass();
@@ -1645,14 +1721,7 @@ export class WorldScene implements SceneRenderer {
   groundHeight = (x: number, z: number): number => {
     const l = this.l0;
     if (!l) return this.resolved.eyeGroundHeight;
-    const fx = (x - l.origin[0]) / l.texel - 0.5;
-    const fz = (z - l.origin[1]) / l.texel - 0.5;
-    const ix = Math.floor(fx), iz = Math.floor(fz);
-    if (ix < 0 || iz < 0 || ix >= l.size - 1 || iz >= l.size - 1) return this.resolved.eyeGroundHeight;
-    const tx = fx - ix, tz = fz - iz;
-    const d = l.data, n = l.size;
-    const h00 = d[iz * n + ix], h10 = d[iz * n + ix + 1], h01 = d[(iz + 1) * n + ix], h11 = d[(iz + 1) * n + ix + 1];
-    return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
+    return sampleL0(l, x, z) ?? this.resolved.eyeGroundHeight;
   };
 
   /** その地点が水（田の泥）か。焼いた材質を読む（world.wgsl の KIND_MUD = 1） */
@@ -1732,6 +1801,154 @@ export class WorldScene implements SceneRenderer {
     }
   }
 
+  /**
+   * 近景段（0.25m / 半径 256m）を歩き手に追従させる。
+   *
+   * 地形の数式は無限に評価できるので、歩ける範囲を縛っていたのはこのテクスチャだった。
+   * 焼き直しは 1 フレームでやると 50ms 級の飛びになるので、行の帯に分けて数フレームに散らす。
+   * 焼く先は「いま使っていない方の層」で、焼き終えてから hmLevels の段 0 を差し替える。
+   * こうすると、焼いている間も絵は前の近景段のまま壊れない。
+   */
+  private stepNearField(encoder: GPUCommandEncoder): void {
+    this.startNearReadback();
+    const device = this.device;
+    const texel = HM_TEXELS[0];
+    const extent = texel * HM_SIZE;
+
+    // 焼き直しの開始判定: 歩き手が中心から離れすぎたら、いまの位置を中心に焼き直す
+    if (!this.near.pending) {
+      const dx = this.walker.x - this.near.origin[0];
+      const dz = this.walker.z - this.near.origin[1];
+      if (Math.hypot(dx, dz) > NEAR_REBAKE_R) {
+        const cx = Math.floor((this.walker.x - extent / 2) / texel) * texel;
+        const cz = Math.floor((this.walker.z - extent / 2) / texel) * texel;
+        this.near.pending = {
+          layer: this.near.layer === 0 ? HM_NEAR_ALT : 0,
+          origin: [cx, cz],
+          band: 0,
+        };
+      }
+    }
+    const pend = this.near.pending;
+    if (!pend) return;
+
+    const rows = HM_SIZE / NEAR_REBAKE_BANDS;
+    const rowStart = pend.band * rows;
+    device.queue.writeBuffer(this.nearParamBuf, 0, new Float32Array([pend.origin[0], pend.origin[1], texel, HM_SIZE]));
+    device.queue.writeBuffer(this.nearBakeLevelBuf, 0, new Float32Array([pend.origin[0], pend.origin[1], texel, HM_SIZE]));
+    device.queue.writeBuffer(this.nearLayerBuf, 0, new Uint32Array([pend.layer, rowStart, 0, 0]));
+    device.queue.writeBuffer(this.nearBakeLayerBuf, 0, new Uint32Array([pend.layer, rowStart, pend.layer, 1]));
+
+    // 高さ → 法線・日向・材質 の順。法線は 1 帯前までの高さを読むので、
+    // 高さの帯を 1 つ先行させる（帯の境で法線が欠けないように）
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.fillPipeline);
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: this.fillLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.nearParamBuf } },
+          { binding: 1, resource: this.heightTex.createView({ dimension: '2d-array' }) },
+          { binding: 2, resource: { buffer: this.nearLayerBuf } },
+        ],
+      }));
+      pass.dispatchWorkgroups(HM_SIZE / 8, rows / 8);
+      pass.end();
+    }
+    if (pend.band > 0) {
+      // 1 帯遅れて法線・材質を焼く（その帯の上下の高さが既に埋まっている）
+      const lightRow = (pend.band - 1) * rows;
+      device.queue.writeBuffer(this.nearBakeLayerBuf, 0, new Uint32Array([pend.layer, lightRow, pend.layer, 1]));
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.lightPipeline);
+      pass.setBindGroup(0, this.frameBindGroup);
+      pass.setBindGroup(1, this.heightBindGroup);
+      pass.setBindGroup(2, device.createBindGroup({
+        layout: this.lightLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.nearBakeLayerBuf } },
+          { binding: 1, resource: this.lightTex.createView({ dimension: '2d-array' }) },
+          { binding: 2, resource: this.matTex.createView({ dimension: '2d-array' }) },
+          { binding: 3, resource: { buffer: this.nearBakeLevelBuf } },
+        ],
+      }));
+      pass.dispatchWorkgroups(HM_SIZE / 8, rows / 8);
+      pass.end();
+    }
+
+    pend.band++;
+    if (pend.band <= NEAR_REBAKE_BANDS) return;
+
+    // 焼き終わり: 段 0 の原点と層を差し替える（ここで初めて絵に効く）
+    this.hmLevelParams.set([pend.origin[0], pend.origin[1], texel, HM_SIZE], 0);
+    this.hmLevelParams[12] = pend.layer;
+    device.queue.writeBuffer(this.hmLevelsBuf, 0, this.hmLevelParams);
+    this.near.layer = pend.layer;
+    this.near.origin = [pend.origin[0] + extent / 2, pend.origin[1] + extent / 2];
+    this.near.pending = null;
+    this.near.rebakes++;
+    this.near.lastRebakeFrame = this.frameIndex;
+
+    // CPU 側（足元の高さ・水の判定）も新しい近景段に入れ替える。
+    // 読み戻しは非同期なので、届くまでは前の近景段を使い続ける（余裕 96m ぶんは有効）
+    if (!this.nearReadBusy && !this.nearReadPending) {
+      encoder.copyTextureToBuffer(
+        { texture: this.heightTex, origin: [0, 0, pend.layer] },
+        { buffer: this.nearHeightRead, bytesPerRow: HM_SIZE * 4, rowsPerImage: HM_SIZE },
+        { width: HM_SIZE, height: HM_SIZE, depthOrArrayLayers: 1 },
+      );
+      encoder.copyTextureToBuffer(
+        { texture: this.matTex, origin: [0, 0, pend.layer] },
+        { buffer: this.nearMatRead, bytesPerRow: HM_SIZE * 4, rowsPerImage: HM_SIZE },
+        { width: HM_SIZE, height: HM_SIZE, depthOrArrayLayers: 1 },
+      );
+      // map はこの encoder を submit したあとでないと「map 中のバッファを submit で使った」になる。
+      // 次のフレームの頭で始める
+      this.nearReadPending = { origin: [pend.origin[0], pend.origin[1]] };
+    }
+  }
+
+  /** 予約しておいた近景段の読み戻しを開始する（前のフレームの submit は済んでいる） */
+  private startNearReadback(): void {
+    const req = this.nearReadPending;
+    if (!req || this.nearReadBusy) return;
+    this.nearReadPending = null;
+    this.nearReadBusy = true;
+    const texel = HM_TEXELS[0];
+    void (async () => {
+      await this.nearHeightRead.mapAsync(GPUMapMode.READ);
+      const hs = new Float32Array(this.nearHeightRead.getMappedRange().slice(0));
+      this.nearHeightRead.unmap();
+      await this.nearMatRead.mapAsync(GPUMapMode.READ);
+      const rgba = new Uint8Array(this.nearMatRead.getMappedRange());
+      const kinds = new Uint8Array(HM_SIZE * HM_SIZE);
+      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 10);
+      this.nearMatRead.unmap();
+      // 入れ替えの前に、新旧で同じ点の高さを突き合わせる（境界の飛びの検出）
+      const oldL0 = this.l0;
+      const next = { origin: req.origin, texel, size: HM_SIZE, data: hs };
+      if (oldL0) {
+        let worst = 0;
+        for (let k = 0; k < 64; k++) {
+          const a = (k / 64) * Math.PI * 2;
+          const rad = 8 + (k % 8) * 9;
+          const x = this.walker.x + Math.cos(a) * rad;
+          const z = this.walker.z + Math.sin(a) * rad;
+          const ha = sampleL0(oldL0, x, z);
+          const hb = sampleL0(next, x, z);
+          if (ha !== null && hb !== null) {
+            worst = Math.max(worst, Math.abs(ha - hb));
+            this.near.swapSamples++;
+          }
+        }
+        this.near.swapDiffMax = Math.max(this.near.swapDiffMax, Number(worst.toFixed(6)));
+      }
+      this.l0 = next;
+      this.matL0 = kinds;
+      this.nearReadBusy = false;
+    })();
+  }
+
   /** 変形の場を 1 歩進める（毎フレーム）。窓の原点は歩き手（＝視点）に追従 */
   private stepDeform(encoder: GPUCommandEncoder): void {
     const extent = DEFORM_SIZE * DEFORM_TEXEL;
@@ -1807,6 +2024,8 @@ export class WorldScene implements SceneRenderer {
         0, 0, 0, 0,
       ]));
     }
+    // 近景段を歩き手に追従させる（歩ける範囲の制約はここにあった）
+    this.stepNearField(encoder);
     // 変形の場を進めてから、フレーム定数（時刻・窓の原点）を書く
     this.stepDeform(encoder);
     this.updateFrame();
@@ -1980,7 +2199,15 @@ export class WorldScene implements SceneRenderer {
     return {
       view: this.view,
       resolved: this.resolved,
-      heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs, detailBakeMs: this.detailBakeMs },
+      heightmap: {
+        size: HM_SIZE, texels: HM_TEXELS, format: 'r32float',
+        bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs, detailBakeMs: this.detailBakeMs,
+        near: {
+          layer: this.near.layer, center: this.near.origin.map((v) => Number(v.toFixed(1))),
+          rebakes: this.near.rebakes, rebaking: this.near.pending !== null,
+          swapDiffMax: this.near.swapDiffMax, swapSamples: this.near.swapSamples,
+        },
+      },
       water: this.waterStats,
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },

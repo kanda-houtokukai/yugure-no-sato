@@ -1,8 +1,10 @@
 // 焼いた高さテクスチャの参照（描画側）。group(1) に束ねる。
 
 struct HeightLevels {
-  // 各段: xy = origin, z = texel, w = size
-  l: array<vec4f, 3>,
+  // 0..2 = 近・中・遠の段: xy = origin, z = texel, w = size
+  // 3 = 近景段が入っているテクスチャの層（x）。近景段は歩き手に追従して焼き直すので、
+  //     焼いている間も絵が壊れないよう 2 つの層を交互に使う
+  l: array<vec4f, 4>,
 };
 
 @group(1) @binding(0) var<uniform> hmLevels: HeightLevels;
@@ -10,6 +12,11 @@ struct HeightLevels {
 @group(1) @binding(2) var hmSamp: sampler;
 
 /** 点 p を含む最も細かい段。境界の 2 テクセル内側までを有効とする */
+/** 段の番号 → テクスチャの層。近景段だけは交互に入れ替わる */
+fn hmLayerOf(levelIndex: i32) -> i32 {
+  return select(levelIndex, i32(hmLevels.l[3].x), levelIndex == 0);
+}
+
 fn heightLevelFor(p: vec2f) -> i32 {
   for (var i = 0; i < 3; i++) {
     let lv = hmLevels.l[i];
@@ -21,10 +28,13 @@ fn heightLevelFor(p: vec2f) -> i32 {
   return 2;
 }
 
-fn sampleHeight(levelIndex: i32, p: vec2f) -> f32 {
-  let lv = hmLevels.l[levelIndex];
+fn sampleHeightAt(layerIdx: i32, lv: vec4f, p: vec2f) -> f32 {
   let uv = (p - lv.xy) / (lv.z * lv.w);
-  return textureSampleLevel(hmTex, hmSamp, uv, levelIndex, 0.0).r;
+  return textureSampleLevel(hmTex, hmSamp, uv, layerIdx, 0.0).r;
+}
+
+fn sampleHeight(levelIndex: i32, p: vec2f) -> f32 {
+  return sampleHeightAt(hmLayerOf(levelIndex), hmLevels.l[levelIndex], p);
 }
 
 /**
@@ -32,7 +42,10 @@ fn sampleHeight(levelIndex: i32, p: vec2f) -> f32 {
  * 4 回の双線形サンプルで 16 テクセル分の B スプラインを作る定番の手法。
  */
 fn sampleHeightCubic(levelIndex: i32, p: vec2f) -> f32 {
-  let lv = hmLevels.l[levelIndex];
+  return sampleHeightCubicAt(hmLayerOf(levelIndex), hmLevels.l[levelIndex], p);
+}
+
+fn sampleHeightCubicAt(layerIdx: i32, lv: vec4f, p: vec2f) -> f32 {
   let texel = lv.z;
   let n = lv.w;
   let coord = (p - lv.xy) / texel - 0.5;
@@ -52,20 +65,25 @@ fn sampleHeightCubic(levelIndex: i32, p: vec2f) -> f32 {
   let uv10 = (vec2f(t1.x, t0.y) + 0.5) / n;
   let uv01 = (vec2f(t0.x, t1.y) + 0.5) / n;
   let uv11 = (vec2f(t1.x, t1.y) + 0.5) / n;
-  let a = textureSampleLevel(hmTex, hmSamp, uv00, levelIndex, 0.0).r;
-  let b = textureSampleLevel(hmTex, hmSamp, uv10, levelIndex, 0.0).r;
-  let c = textureSampleLevel(hmTex, hmSamp, uv01, levelIndex, 0.0).r;
-  let d = textureSampleLevel(hmTex, hmSamp, uv11, levelIndex, 0.0).r;
+  let a = textureSampleLevel(hmTex, hmSamp, uv00, layerIdx, 0.0).r;
+  let b = textureSampleLevel(hmTex, hmSamp, uv10, layerIdx, 0.0).r;
+  let c = textureSampleLevel(hmTex, hmSamp, uv01, layerIdx, 0.0).r;
+  let d = textureSampleLevel(hmTex, hmSamp, uv11, layerIdx, 0.0).r;
   return mix(mix(a, b, s1.x / (s0.x + s1.x)), mix(c, d, s1.x / (s0.x + s1.x)), s1.y / (s0.y + s1.y));
 }
 
 /** 法線。全段を双三次で読む（斜め光では法線 1° の誤差が明るさ 30% の縞になる）。差分の刻みは画素の足元とテクセルの大きい方 */
 fn sampleNormal(p: vec2f, pixelSize: f32) -> vec3f {
   let li = heightLevelFor(p);
-  let d = max(hmLevels.l[li].z, pixelSize * 0.75);
-  let hl = sampleHeightCubic(li, p - vec2f(d, 0.0));
-  let hr = sampleHeightCubic(li, p + vec2f(d, 0.0));
-  let hd = sampleHeightCubic(li, p - vec2f(0.0, d));
-  let hu = sampleHeightCubic(li, p + vec2f(0.0, d));
+  return sampleNormalAt(hmLayerOf(li), hmLevels.l[li], p, pixelSize);
+}
+
+/** 段を明示して法線を取る（焼き直し中の層を、まだ有効でない段として読むため） */
+fn sampleNormalAt(layerIdx: i32, lv: vec4f, p: vec2f, pixelSize: f32) -> vec3f {
+  let d = max(lv.z, pixelSize * 0.75);
+  let hl = sampleHeightCubicAt(layerIdx, lv, p - vec2f(d, 0.0));
+  let hr = sampleHeightCubicAt(layerIdx, lv, p + vec2f(d, 0.0));
+  let hd = sampleHeightCubicAt(layerIdx, lv, p - vec2f(0.0, d));
+  let hu = sampleHeightCubicAt(layerIdx, lv, p + vec2f(0.0, d));
   return normalize(vec3f(hl - hr, 2.0 * d, hd - hu));
 }

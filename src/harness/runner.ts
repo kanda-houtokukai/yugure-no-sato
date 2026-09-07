@@ -19,7 +19,9 @@ function bytesPerRowFor(width: number): number {
 const MEASURE_TAIL = 60;
 /** タイムスタンプを取る末尾のフレーム数（QuerySet の上限に収める） */
 const TS_FRAMES = 120;
-const LOOP_TIMEOUT_MS = 90000;
+// 描画ループの見張り。ハングを検出するためのもので、長い筋書き（遠出の実測）では
+// 規定フレーム数を 60fps で描く時間の 3 倍まで待つ
+const loopTimeoutMs = (frameCount: number): number => Math.max(90000, (frameCount / 60) * 3000 + 15000);
 
 export interface ShaderMessage {
   module: string;
@@ -153,7 +155,7 @@ export async function runScene(
     const watchdog = setTimeout(() => {
       timedOut = true;
       resolve();
-    }, LOOP_TIMEOUT_MS);
+    }, loopTimeoutMs(FRAME_COUNT));
     const tick = (now: number): void => {
       if (lastTs >= 0) cpuFrameMs.push(now - lastTs);
       lastTs = now;

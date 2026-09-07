@@ -99,6 +99,9 @@ export function scriptInput(name: string, frame: number): WalkerInput {
       if (frame < 350) return { ...IDLE_INPUT, forward: 0.4, yawDelta: 180 / 60, pitchDelta: 30 / 60 };  // 振り返り、カメラを 30° 上げる
       return IDLE_INPUT;
     }
+    // 遠出。まっすぐ走り続ける（歩ける範囲と、遠方でのフレーム時間の実測に使う）
+    case 'trek':
+      return { ...IDLE_INPUT, forward: 1, run: true };
     default:
       return IDLE_INPUT;
   }

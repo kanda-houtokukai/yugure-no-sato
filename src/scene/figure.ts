@@ -103,6 +103,7 @@ export class Figure {
   private lean = 0;
   private time = 0;
   private started = false;
+  private prevGround: number | null = null;
   /** 直近の歩容の状態（レポート・検証用） */
   stats = {
     hipY: 0, roll: 0, inWater: false, phase: 0,
@@ -115,6 +116,9 @@ export class Figure {
     /** 腰の高さの最小・最大（起伏に追随しているか） */
     hipMin: 1e9, hipMax: -1e9, hipMinT: 0, hipMinGround: 0, hipMinReach: 0,
     groundMin: 1e9, groundMax: -1e9,
+    /** 足元の地面の 1 フレームあたりの変化の最大 [m]。近景段を焼き直した瞬間に
+     *  地形が飛ぶと、ここに歩幅では説明できない値が出る */
+    groundStepMax: 0, groundStepAtT: 0,
     /** 腰の高さ − 足元の地面。歩容だけの上下（地形の起伏を除く） */
     aboveMin: 1e9, aboveMax: -1e9,
     /** 腰の高さ − 支えている足。地形も歩幅の前後も除いた、純粋な上下動 */
@@ -298,6 +302,14 @@ export class Figure {
     hipY = Math.max(hipY, hipFloor);
     this.stats.hipY = hipY;
     const g = s.groundHeight(s.x, s.z);
+    if (this.prevGround !== null) {
+      const d = Math.abs(g - this.prevGround);
+      if (d > this.stats.groundStepMax) {
+        this.stats.groundStepMax = Number(d.toFixed(5));
+        this.stats.groundStepAtT = Number(this.time.toFixed(2));
+      }
+    }
+    this.prevGround = g;
     this.stats.groundMin = Math.min(this.stats.groundMin, g);
     this.stats.groundMax = Math.max(this.stats.groundMax, g);
     this.stats.aboveMin = Math.min(this.stats.aboveMin, hipY - g);

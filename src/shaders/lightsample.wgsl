@@ -7,10 +7,11 @@ struct BakedLight { normal: vec3f, shadow: f32, ridgeDist: f32, albedo: vec3f, k
 
 fn bakedLight(p: vec2f) -> BakedLight {
   let li = heightLevelFor(p);
+  let lay = hmLayerOf(li);
   let lv = hmLevels.l[li];
   let uv = (p - lv.xy) / (lv.z * lv.w);
-  let t = textureSampleLevel(lightTex, hmSamp, uv, li, 0.0);
-  let m = textureSampleLevel(matTex, hmSamp, uv, li, 0.0);
+  let t = textureSampleLevel(lightTex, hmSamp, uv, lay, 0.0);
+  let m = textureSampleLevel(matTex, hmSamp, uv, lay, 0.0);
   let y = sqrt(max(0.0, 1.0 - dot(t.rg, t.rg)));
   var out: BakedLight;
   out.normal = normalize(vec3f(t.r, y, t.g));
