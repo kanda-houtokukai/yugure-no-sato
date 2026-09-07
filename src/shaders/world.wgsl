@@ -63,6 +63,90 @@ fn mountains(p: vec2f, t: f32, minWl: f32) -> f32 {
   return h;
 }
 
+// ---------- 峠 ----------
+// 里の北東を尾根が塞ぎ、一点だけ低い鞍部がある。そこへ九十九折りの道を上げる。
+// 丘（t=0.95→3.6 で 70m）は勾配 9° 程度で緩く、そのままでは折り返す理由が生まれない。
+// 尾根を足して斜面を 20° 級にすることで、九十九折りが必然になる。
+const PASS_U: f32 = 210.0;    // 鞍部の u（東西）
+const PASS_V: f32 = 395.0;    // 尾根の稜線の v（川からの距離）
+
+fn passRidge(uv: vec2f) -> f32 {
+  let d = (uv.y - PASS_V) / 150.0;
+  let ridge = exp(-d * d * 1.6);
+  // 鞍部: u = PASS_U のあたりだけ低い
+  let sN = (uv.x - PASS_U) / 120.0;
+  let notch = 1.0 - 0.62 * exp(-sN * sN * 1.4);
+  return 78.0 * ridge * notch;
+}
+
+/**
+ * 細かな起伏を含まない、なめらかな地面。峠道の路面の高さに使う。
+ * 実際の地面（fbm の凹凸つき）を路面にすると、道が波打って山道に見えない。
+ */
+fn smoothLand(uv: vec2f) -> f32 {
+  let t = basinT(uv);
+  let outlet = smootherstep(-320.0, -620.0, uv.x) * (1.0 - smootherstep(110.0, 260.0, abs(uv.y)));
+  var h = valleyFloor(uv);
+  if (t > 0.85) { h += 70.0 * pow(smootherstep(0.95, 3.6, t), 1.5) * (1.0 - 0.7 * outlet); }
+  h += passRidge(uv);
+  return h;
+}
+
+/** 線分までの距離。任意の向きの道に使う（lineA / lineB の格子に乗らないもの） */
+fn segDist(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+  let ab = b - a;
+  let ap = p - a;
+  let hh = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+  return length(ap - ab * hh);
+}
+
+/** 峠道の折り返しの点（谷座標）。0 = 麓、5 = 鞍部の見晴らし場 */
+fn passNode(i: i32) -> vec2f {
+  switch (i) {
+    case 0: { return vec2f(150.0, 235.0); }
+    case 1: { return vec2f(268.0, 268.0); }
+    case 2: { return vec2f(152.0, 300.0); }
+    case 3: { return vec2f(272.0, 330.0); }
+    case 4: { return vec2f(160.0, 358.0); }
+    default: { return vec2f(210.0, 384.0); }
+  }
+}
+
+struct PassRoad { dist: f32, h: f32, t: f32 };
+
+/**
+ * 峠道。折れ線までの距離と、そこでの路面の高さを返す。
+ *
+ * 路面の高さを「近くの地面」から取ると、尾根の鞍部の形をなぞって道が波打つ（実測）。
+ * 麓と鞍部の高さを両端に取り、道のりに比例して上げる＝一定勾配にする。これが人が付けた道の形。
+ * 幅の方向には水平にならす（切土・盛土）ので、斜面に埋まることも浮くこともない。
+ */
+fn passRoad(uv: vec2f) -> PassRoad {
+  var out: PassRoad;
+  out.dist = 1e9; out.t = 0.0;
+  // 各区間の長さを先に足して、道のり全体を出す
+  var total = 0.0;
+  for (var i = 0; i < 5; i++) { total += length(passNode(i + 1) - passNode(i)); }
+  var acc = 0.0;
+  for (var i = 0; i < 5; i++) {
+    let a = passNode(i);
+    let b = passNode(i + 1);
+    let ab = b - a;
+    let ap = uv - a;
+    let hh = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    let d = length(ap - ab * hh);
+    if (d < out.dist) {
+      out.dist = d;
+      out.t = (acc + hh * length(ab)) / total;
+    }
+    acc += length(ab);
+  }
+  let hFoot = smoothLand(passNode(0));
+  let hTop = smoothLand(passNode(5));
+  out.h = mix(hFoot, hTop, out.t) + 0.10;
+  return out;
+}
+
 /** 神社の丘（北側、主要なあぜ道の突き当たり）。石段・杉並木はフェーズ2 */
 fn shrineHill(uv: vec2f) -> f32 {
   let d = length((uv - vec2f(0.0, 262.0)) / vec2f(75.0, 60.0));
@@ -79,6 +163,10 @@ const YARD_FEATHER: f32 = 7.5;                  // 縁の傾斜の幅 [m]。広�
 const PRECINCT_C: vec2f = vec2f(0.0, 270.0);    // 神社の境内
 const PRECINCT_H: vec2f = vec2f(34.0, 24.0);
 const PRECINCT_FEATHER: f32 = 8.0;              // 石段が上がる斜面の幅
+// 峠の見晴らし場。上りきったところに立ち止まる理由を置く（東屋・大石）
+const LOOKOUT_C: vec2f = vec2f(214.0, 379.0);
+const LOOKOUT_H: vec2f = vec2f(10.0, 7.0);
+const LOOKOUT_FEATHER: f32 = 6.0;
 
 /** 角丸の矩形の内外。1 = 内側、0 = 外側。縁は低周波ノイズで乱して人工的な直線を避ける */
 fn flatMask(uv: vec2f, center: vec2f, half: vec2f, feather: f32, seed: u32) -> f32 {
@@ -91,6 +179,9 @@ fn flatMask(uv: vec2f, center: vec2f, half: vec2f, feather: f32, seed: u32) -> f
 
 /** 敷地の高さ: 隣の田より約 1m 高い平場 */
 fn yardLevel() -> f32 { return valleyFloor(YARD_C) + 0.85; }
+
+/** 峠の見晴らし場の高さ: 峠道の路面と同じ高さ（道から段差なく入れる） */
+fn lookoutLevel() -> f32 { return smoothLand(passNode(5)) + 0.12; }
 
 /** 境内の高さ: 丘の頂をならした平場 */
 fn precinctLevel() -> f32 {
@@ -107,6 +198,8 @@ fn flatSite(uv: vec2f) -> FlatSite {
   if (wy > 0.0) { f.w = wy; f.level = yardLevel(); f.kind = KIND_YARD; }
   let wp = flatMask(uv, PRECINCT_C, PRECINCT_H, PRECINCT_FEATHER, 132u);
   if (wp > f.w) { f.w = wp; f.level = precinctLevel(); f.kind = KIND_PRECINCT; }
+  let wl = flatMask(uv, LOOKOUT_C, LOOKOUT_H, LOOKOUT_FEATHER, 133u);
+  if (wl > f.w) { f.w = wl; f.level = lookoutLevel(); f.kind = KIND_TRAIL; }
   return f;
 }
 
@@ -224,6 +317,10 @@ fn nearestPath(uv: vec2f, floorH: f32) -> PathHit {
   if (uv.y > RIVER_BAND - 1.0 && uv.y < 150.0) {
     considerPath(&best, abs(uv.x - lineB(5, uv.y)), 0.7, floorH + 0.42);
   }
+  // 峠へ向かう枝道。主道（u≈0）の v=150 あたりから北東へ、峠の麓（150, 235）まで
+  if (uv.x > -10.0 && uv.x < 165.0 && uv.y > 140.0 && uv.y < 250.0) {
+    considerPath(&best, segDist(uv, vec2f(4.0, 150.0), vec2f(150.0, 235.0)), 0.85, floorH + 0.45);
+  }
   best.on = best.dist < best.halfWidth;
   return best;
 }
@@ -239,6 +336,7 @@ const KIND_MOUNTAIN: u32 = 6u;
 const KIND_YARD: u32 = 7u;        // 集落の敷地（踏み固められた土）
 const KIND_PRECINCT: u32 = 8u;    // 神社の境内（玉砂利まじりの土）
 const KIND_STEPS: u32 = 9u;       // 石段（境内へ上がる斜面）
+const KIND_TRAIL: u32 = 10u;      // 山道（石まじりの踏み固めた土）
 
 struct Surface {
   height: f32,
@@ -265,6 +363,7 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
 
   var h = floorH;
   if (t > 0.85) { h += hills(p, t, minWl) * (1.0 - 0.7 * outlet); }
+  h += passRidge(uv);   // 峠の尾根
   if (t > 5.9) { h += mountains(p, t, minWl) * (1.0 - 0.85 * outlet); }
   if (t < 1.6 && abs(uv.x) < 200.0) { h += shrineHill(uv); }
   // 自然地の細かな起伏（近くでは 0.3m の波長まで）
@@ -337,6 +436,18 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
     s.ridgeDist = min(s.ridgeDist, path.dist);
   }
 
+  // 峠道: 斜面を水平に削って段にする（切土・盛土）。土手にすると 20° の斜面では
+  // 片側が宙に浮き、反対側が山に埋まる。折り返しの道は「段」でなければ成立しない
+  if (uv.y > 200.0 && uv.y < 430.0 && uv.x > 100.0 && uv.x < 330.0) {
+    let road = passRoad(uv);
+    if (road.dist < 8.5) {
+      let w = 1.0 - smootherstep(3.0, 8.5, road.dist);
+      h = mix(h, road.h, w);
+      if (road.dist < 2.4) { s.kind = KIND_TRAIL; s.wet = 0.0; }
+      s.ridgeDist = min(s.ridgeDist, road.dist);
+    }
+  }
+
   // 石段: 境内へ上がる斜面（v=240〜254）で、参道の高さを段状に量子化する。
   // 別メッシュで載せると、道の土手や地形の S 字と競合して埋まる（実測で解決できなかった）。
   // 地形そのものを段にすれば、原理的に埋まりも浮きもしない
@@ -383,6 +494,10 @@ fn terrainAlbedo(p: vec2f, s: Surface) -> vec3f {
     case 7u: { return mix(vec3f(0.33, 0.28, 0.21), vec3f(0.46, 0.40, 0.30), n); }        // 集落の敷地（乾いた踏み固めの土。田の泥と分ける）
     case 8u: { return mix(vec3f(0.33, 0.31, 0.27), vec3f(0.45, 0.42, 0.37), n); }        // 境内（玉砂利まじり）
     case 9u: { return mix(vec3f(0.22, 0.215, 0.20), vec3f(0.34, 0.33, 0.31), n); }       // 石段
+    case 10u: {                                                                          // 山道（石まじり）
+      let stone = 0.5 + 0.5 * gnoise(p * 1.6, 83u);
+      return mix(vec3f(0.34, 0.30, 0.24), vec3f(0.50, 0.45, 0.37), n) * (0.86 + 0.26 * stone);
+    }
     default: { return mix(vec3f(0.20, 0.30, 0.09), vec3f(0.32, 0.38, 0.14), n); }        // 草地
   }
 }

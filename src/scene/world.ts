@@ -36,7 +36,7 @@ import {
   type FarmhouseParams,
 } from './buildings';
 import {
-  buildDryingRack, buildStones, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
+  buildDryingRack, buildShelter, buildStones, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
 } from './props';
 import { Figure } from './figure';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
@@ -251,6 +251,7 @@ export class WorldScene implements SceneRenderer {
   private yardEdge: { where: string; drop: number; maxSlopeDeg: number; over: number }[] = [];
   /** 据えた建物・小物の実座標（寄りの絵を撮るときの当たり先） */
   private placements: { kind: string; u: number; v: number; x: number; z: number; y: number }[] = [];
+  private passProfile: { u: number; v: number; h: number }[] = [];
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -1178,7 +1179,7 @@ export class WorldScene implements SceneRenderer {
       const rgba = new Uint8Array(matRead.getMappedRange());
       const kinds = new Uint8Array(HM_SIZE * HM_SIZE);
       // a = kind / 10 を 8bit に丸めたもの。戻して整数の種別にする
-      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 10);
+      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 16);
       this.matL0 = kinds;
     }
     matRead.unmap();
@@ -1412,6 +1413,18 @@ export class WorldScene implements SceneRenderer {
       { where: '敷地の中（中央）', v: -128 },
       { where: '敷地の外（北の田）', v: -95 },
     ];
+    // 峠まわりの高さ（段階2 の設計用）。u を振って鞍部と稜線の差を見る
+    const passPts: [number, number][] = [];
+    for (const v of [175, 250, 290, 330, 360, 395, 430, 470]) passPts.push([210, v]);
+    for (const u of [0, 100, 210, 320, 430]) passPts.push([u, 395]);
+    {
+      const rz = new Float32Array(await this.runQuery('riverQuery', [
+        { binding: 6, data: new Float32Array(passPts.map((q) => q[0])), type: 'read-only-storage' },
+      ], { binding: 7, byteLength: passPts.length * 4 }, Math.ceil(passPts.length / 64)));
+      const world = passPts.map((q, i) => [q[0], q[1] + rz[i]] as [number, number]);
+      const hs = await this.queryHeights(this.queryModule, world);
+      this.passProfile = passPts.map((q, i) => ({ u: q[0], v: q[1], h: Number(hs[i].toFixed(2)) }));
+    }
     const rz = new Float32Array(await this.runQuery('riverQuery', [
       { binding: 6, data: new Float32Array(spots.map(() => 0)), type: 'read-only-storage' },
     ], { binding: 7, byteLength: spots.length * 4 }, Math.ceil(spots.length / 64)));
@@ -1540,6 +1553,10 @@ export class WorldScene implements SceneRenderer {
       { kind: 'stones', u: -8, v: -130.5, rot: deg(0), scale: 1.0 },
       { kind: 'stones', u: 26, v: -134, rot: deg(40), scale: 0.9 },
       { kind: 'stones', u: -38, v: -126, rot: deg(-30), scale: 0.8 },
+      // --- 峠の見晴らし場（フェーズ7 段階2）。上りきったところの報酬 ---
+      { kind: 'shelter', u: 218, v: 383, rot: deg(184), scale: 1.0 },   // 里（南）を向いて座れる
+      { kind: 'stones', u: 207, v: 374, rot: deg(24), scale: 1.35 },
+      { kind: 'stones', u: 222, v: 373, rot: deg(-52), scale: 0.9 },
     ];
     // 石段の勾配は地形から決める（決め打ちだと埋まるか浮く）。下端と上端の高さを正本に問い合わせる
     const stairV0 = 240;
@@ -1587,6 +1604,7 @@ export class WorldScene implements SceneRenderer {
       tools: buildTools(541),
       vessels: buildVessels(551),
       stones: buildStones(561),
+      shelter: buildShelter(571),
     };
     this.buildingDraws = [];
     const kindsStat: { name: string; vertices: number; instances: number }[] = [];
@@ -1922,7 +1940,7 @@ export class WorldScene implements SceneRenderer {
       await this.nearMatRead.mapAsync(GPUMapMode.READ);
       const rgba = new Uint8Array(this.nearMatRead.getMappedRange());
       const kinds = new Uint8Array(HM_SIZE * HM_SIZE);
-      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 10);
+      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 16);
       this.nearMatRead.unmap();
       // 入れ替えの前に、新旧で同じ点の高さを突き合わせる（境界の飛びの検出）
       const oldL0 = this.l0;
@@ -2217,6 +2235,7 @@ export class WorldScene implements SceneRenderer {
       pathProfile: this.pathProfile,
       yardEdge: this.yardEdge,
       placements: this.placements,
+      passProfile: this.passProfile,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },

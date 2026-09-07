@@ -18,6 +18,6 @@ fn bakedLight(p: vec2f) -> BakedLight {
   out.shadow = t.b;
   out.ridgeDist = t.a;
   out.albedo = m.rgb;
-  out.kind = u32(round(m.a * 10.0));
+  out.kind = u32(round(m.a * 16.0));
   return out;
 }

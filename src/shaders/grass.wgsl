@@ -44,6 +44,7 @@ fn grassDensity(p: vec2f, b: BakedLight) -> f32 {
       return (0.05 + 0.55 * smootherstep(0.12, 0.55, edge)) * (0.35 + 0.65 * mottle);
     }
     case 8u: { return 0.04 * mottle; }                                // 境内: ほとんど生えない
+    case 10u: { return 0.16 * mottle; }                               // 山道・峠の平場: 縁にわずか
     case 9u: { return 0.0; }                                          // 石段: 生えない
     default: { return 0.0; }                                         // 田の泥・道の上・川床・山には生えない
   }

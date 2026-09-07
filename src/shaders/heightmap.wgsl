@@ -64,5 +64,5 @@ fn bakeNormalShadow(@builtin(global_invocation_id) gid: vec3u) {
   // a = 畦・道の中心線までの距離。水面がその線上を discard して、遠くでも区画の網目を保つ
   let surf = terrainSurface(p, lv.z * 2.0);
   textureStore(outLight, vec2i(id.xy), i32(bakeLayer.x), vec4f(nrm.x, nrm.z, shade, min(surf.ridgeDist, 50.0)));
-  textureStore(outMaterial, vec2i(id.xy), i32(bakeLayer.x), vec4f(terrainAlbedo(p, surf), f32(surf.kind) / 10.0));
+  textureStore(outMaterial, vec2i(id.xy), i32(bakeLayer.x), vec4f(terrainAlbedo(p, surf), f32(surf.kind) / 16.0));
 }

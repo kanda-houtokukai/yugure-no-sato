@@ -4,7 +4,7 @@
 // 追加した材質の種別（building.wgsl の kind）:
 //   10 作物の葉  11 竹  12 藁・干し草  13 割った薪の木口  14 耕した土（畝）  15 農具の刃（鉄）  16 薪の樹皮
 
-import { MAT_PLANK, MAT_POST, MAT_STONE } from './buildings';
+import { MAT_DECK, MAT_PLANK, MAT_POST, MAT_STONE } from './buildings';
 import { MeshBuilder, rng, type V3 } from './mesh';
 
 export const MAT_LEAF = 10;
@@ -357,5 +357,60 @@ export function buildStones(seed: number): Float32Array {
   rock(m, [1.05, 0.11, 0.42], [0.52, 0.26, 0.46], seed + 2);
   rock(m, [-0.72, 0.09, -0.55], [0.44, 0.22, 0.40], seed + 3);
   if (r() > 0.4) rock(m, [0.35, 0.07, -0.95], [0.34, 0.17, 0.33], seed + 4);
+  return m.toFloat32Array();
+}
+
+/**
+ * 峠の休み処。四本柱に板葺きの切妻をかけ、片側に縁台を置いただけの簡素なもの。
+ * 上りきったところに「立ち止まる理由」を作る。
+ */
+export function buildShelter(seed: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const W = 2.9, D = 2.3;          // 柱の間隔
+  const postH = 2.15;
+  const ridge = postH + 0.95;
+  const eave = 0.55;               // 軒の出
+  // 柱（面取りのため 6 角）と足元の石
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const x = sx * W / 2, z = sz * D / 2;
+    const lean = (r() - 0.5) * 0.04;
+    m.tube([x, 0.16, z], [x + lean, postH, z + lean], 0.075, 0.065, 6, MAT_POST);
+    rock(m, [x, 0.08, z], [0.40, 0.22, 0.38], seed + 40 + sx * 3 + sz, MAT_STONE, 0.30);
+  }
+  // 桁と梁
+  for (const sz of [-1, 1]) m.tube([-W / 2 - 0.1, postH, sz * D / 2], [W / 2 + 0.1, postH, sz * D / 2], 0.055, 0.055, 5, MAT_POST);
+  for (const sx of [-1, 1]) m.tube([sx * W / 2, postH + 0.06, -D / 2], [sx * W / 2, postH + 0.06, D / 2], 0.050, 0.050, 5, MAT_POST);
+  // 棟木と垂木
+  m.tube([-W / 2 - eave, ridge, 0], [W / 2 + eave, ridge, 0], 0.060, 0.060, 5, MAT_POST);
+  const rafters = 7;
+  for (let i = 0; i < rafters; i++) {
+    const x = -W / 2 - eave * 0.6 + ((W + eave * 1.2) * i) / (rafters - 1);
+    for (const sz of [-1, 1]) {
+      m.tube([x, ridge - 0.05, 0], [x, postH - 0.10, sz * (D / 2 + eave)], 0.030, 0.026, 4, MAT_POST);
+    }
+  }
+  // 板葺きの屋根（両流れ）。板の重なりを段で出す
+  const courses = 4;
+  for (const sz of [-1, 1]) {
+    for (let c = 0; c < courses; c++) {
+      const t0 = c / courses, t1 = (c + 1) / courses + 0.04;
+      // 板は垂木の「上」に載る。同じ面に置くと干渉して格子に見える
+      const y0 = ridge - (ridge - (postH - 0.12)) * t0 + 0.05;
+      const y1 = ridge - (ridge - (postH - 0.12)) * Math.min(1, t1) + 0.05;
+      const z0 = sz * (D / 2 + eave) * t0;
+      const z1 = sz * (D / 2 + eave) * Math.min(1, t1);
+      const hx = W / 2 + eave;
+      m.quad([-hx, y0, z0], [hx, y0, z0], [hx, y1, z1], [-hx, y1, z1], MAT_PLANK);
+    }
+  }
+  // 縁台（腰かけ）
+  const bh = 0.42;
+  for (const sx of [-1, 1]) m.tube([sx * (W / 2 - 0.25), 0.02, -D / 2 + 0.45], [sx * (W / 2 - 0.25), bh, -D / 2 + 0.45], 0.055, 0.050, 5, MAT_POST);
+  for (const sx of [-1, 1]) m.tube([sx * (W / 2 - 0.25), 0.02, -D / 2 + 0.95], [sx * (W / 2 - 0.25), bh, -D / 2 + 0.95], 0.055, 0.050, 5, MAT_POST);
+  for (let i = 0; i < 3; i++) {
+    const z = -D / 2 + 0.42 + i * 0.28;
+    m.box([0, bh + 0.03, z], [W - 0.3, 0.045, 0.24], MAT_DECK);
+  }
   return m.toFloat32Array();
 }
