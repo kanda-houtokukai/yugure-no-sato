@@ -308,31 +308,37 @@ fn nearestPath(uv: vec2f, floorH: f32) -> PathHit {
   var best: PathHit;
   best.dist = 1e9; best.halfWidth = 1.1; best.top = floorH + 0.55; best.on = false;
 
-  // 主道。境内（v≈246〜294）まで通す。途中で切ると、石段の斜面が草地のままになる
-  if (uv.y > -190.0 && uv.y < 288.0) {
+  // 道の網（フェーズ7 段階3）。どの道も端が別の道か行き先（集落・神社・峠・隣村）で終わる。
+  // 途中で切れる道を作らないため、範囲は互いの交点に合わせてある。
+  //
+  // 主道: 集落（v=-162）から橋を渡り、神社の境内（v≈288）まで
+  if (uv.y > -162.0 && uv.y < 288.0) {
     considerPath(&best, abs(uv.x - lineB(0, uv.y)), 1.1, floorH + 0.55);
   }
-  // 副道（横線 4 と -3 に沿う）
-  if (uv.x > -210.0 && uv.x < 170.0) {
+  // 北の環: 横線 4（v≈57.5）。西端は隣村、東端は縦線 5。途中で主道と交わる
+  if (uv.x > -470.0 && uv.x < 132.0) {
     considerPath(&best, abs(uv.y - lineA(4, uv.x)), 0.8, floorH + 0.45);
   }
-  if (uv.x > -150.0 && uv.x < 230.0) {
+  // 南の環: 横線 -3（v≈-57.5）。西端は縦線 -4、東端は主道
+  if (uv.x > -104.0 && uv.x < 4.0) {
     considerPath(&best, abs(uv.y - lineA(-3, uv.x)), 0.8, floorH + 0.45);
   }
-  // 枝道（縦線 -4 と 5 に沿う。川の帯は跨がない）
-  if (uv.y > -110.0 && uv.y < -RIVER_BAND + 1.0) {
+  // 縦線 -4: 集落の北の縁（v=-112）から横線 -3 まで
+  if (uv.y > -112.0 && uv.y < -55.0) {
     considerPath(&best, abs(uv.x - lineB(-4, uv.y)), 0.7, floorH + 0.42);
   }
-  if (uv.y > RIVER_BAND - 1.0 && uv.y < 150.0) {
+  // 縦線 5: 川沿いの道（v=6.5）から横線 4 まで
+  if (uv.y > 5.5 && uv.y < 60.0) {
     considerPath(&best, abs(uv.x - lineB(5, uv.y)), 0.7, floorH + 0.42);
   }
   // 川沿いの道（北岸）。橋のたもとから西へ、谷の出口の集落まで続く
-  if (uv.x > -560.0 && uv.x < 240.0) {
+  // 西端は隣村への分岐、東端は縦線 5。途中で橋のたもと（主道）と交わる
+  if (uv.x > -470.0 && uv.x < 132.0) {
     considerPath(&best, abs(uv.y - lineA(1, uv.x)), 0.75, floorH + 0.42);
   }
   // 隣村へ上がる短い枝道（川沿いの道 → 集落）
-  if (uv.x > -500.0 && uv.x < -400.0 && uv.y > 0.0 && uv.y < 50.0) {
-    considerPath(&best, segDist(uv, vec2f(-448.0, 8.0), vec2f(-455.0, 40.0)), 0.7, floorH + 0.42);
+  if (uv.x > -500.0 && uv.x < -400.0 && uv.y > 0.0 && uv.y < 66.0) {
+    considerPath(&best, segDist(uv, vec2f(-448.0, 8.0), vec2f(-455.0, 58.0)), 0.7, floorH + 0.42);
   }
   // 峠へ向かう枝道。主道（u≈0）の v=150 あたりから北東へ、峠の麓（150, 235）まで
   if (uv.x > -10.0 && uv.x < 165.0 && uv.y > 140.0 && uv.y < 250.0) {

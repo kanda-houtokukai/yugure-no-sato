@@ -24,6 +24,10 @@ export interface View {
   readonly walkFrom?: { x: number; z: number };
   /** 歩き手の進む向き [度]。視点を固定したとき、カメラの向きと切り離す */
   readonly walkYaw?: number;
+  /** 経由点（世界座標 x,z の並び）。道が繋がっていることを歩いて示すのに使う */
+  readonly route?: [number, number][];
+  /** 経由点をたどるとき走るか */
+  readonly routeRun?: boolean;
   /** 方位（北 = 0°, 東 = 90°）と仰角（度） */
   readonly yawDeg: number;
   readonly pitchDeg: number;
@@ -92,6 +96,14 @@ export function viewFromUrl(search: string): View {
       return w.length === 2 && w.every(Number.isFinite) ? { fixedCam: true, walkFrom: { x: w[0], z: w[1] } } : {};
     })() : {}),
     ...(q.has('walkYaw') ? { walkYaw: num(q, 'walkYaw', 0) } : {}),
+    ...(q.has('route') ? (() => {
+      const pts: [number, number][] = [];
+      for (const item of (q.get('route') ?? '').split(';')) {
+        const [a, b] = item.split(',').map(Number);
+        if (Number.isFinite(a) && Number.isFinite(b)) pts.push([a, b]);
+      }
+      return pts.length > 0 ? { route: pts, routeRun: q.get('routeRun') === '1' } : {};
+    })() : {}),
     frames: num(q, 'frames', b.frames ?? 120),
     ...(q.has('camDist') ? { camDist: num(q, 'camDist', 3) } : b.camDist !== undefined ? { camDist: b.camDist } : {}),
     yawDeg: num(q, 'yaw', b.yawDeg),

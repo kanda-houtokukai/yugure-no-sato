@@ -24,6 +24,42 @@ export class Walker {
   lastMoved = 0;
   /** 直前の入力が走りだったか */
   lastRunning = false;
+  /** 経由点をたどる歩き方（道が繋がっていることを実際に歩いて示すため） */
+  private route: [number, number][] = [];
+  private routeIndex = 0;
+  /** 経由点に着いた回数と、たどった距離 */
+  routeReached = 0;
+  routeDistance = 0;
+
+  setRoute(points: [number, number][]): void {
+    this.route = points;
+    this.routeIndex = 0;
+    this.routeReached = 0;
+    this.routeDistance = 0;
+  }
+
+  /** 経由点へ向かう操作を作る。着いたら次へ。全部着いたら止まる */
+  routeInput(run: boolean): WalkerInput {
+    if (this.routeIndex >= this.route.length) return IDLE_INPUT;
+    const [tx, tz] = this.route[this.routeIndex];
+    const dx = tx - this.x, dz = tz - this.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 2.5) {
+      this.routeIndex++;
+      this.routeReached++;
+      return this.routeIndex >= this.route.length ? IDLE_INPUT : this.routeInput(run);
+    }
+    // 目標の方位へ、1 フレームあたり最大 3.2° 向きを寄せる
+    const want = (Math.atan2(dx, dz) * 180) / Math.PI;
+    let turn = ((want - this.yawDeg + 540) % 360) - 180;
+    turn = Math.max(-3.2, Math.min(3.2, turn));
+    // 向きが大きくずれている間は速度を落とす（その場でくるくる回らない）
+    const align = Math.max(0, Math.cos(((want - this.yawDeg) * Math.PI) / 180));
+    return { forward: 0.35 + 0.65 * align, strafe: 0, yawDelta: turn, pitchDelta: 0, run };
+  }
+
+  /** 経由点をすべて回りきったか */
+  routeDone(): boolean { return this.route.length > 0 && this.routeIndex >= this.route.length; }
 
   // 実寸（歩き 1.4m/s）だと画面では遅く感じる。体感に合わせて上げた（2026-09-07）
   static readonly WALK_SPEED = 2.2;   // m/s
@@ -57,6 +93,7 @@ export class Walker {
       this.z += mz * dist;
       this.lastDirX = mx; this.lastDirZ = mz;
       this.lastMoved = dist;
+      this.routeDistance += dist;
     }
     this.y = groundHeight(this.x, this.z);
   }

@@ -413,6 +413,7 @@ export class WorldScene implements SceneRenderer {
     this.walker.x = this.view.walkFrom ? this.view.walkFrom.x : eyeXZ[0];
     this.walker.z = this.view.walkFrom ? this.view.walkFrom.z : eyeXZ[1];
     this.walker.yawDeg = this.view.walkYaw ?? this.view.yawDeg;
+    if (this.view.route) this.walker.setRoute(this.view.route);
     this.updateFrame();
 
     // --- 描画先 ---
@@ -2044,10 +2045,12 @@ export class WorldScene implements SceneRenderer {
     const { encoder } = ctx;
     this.frameIndex = ctx.frameIndex;
     // 歩き手: 筋書きか実操作で 1 歩進め、足跡と通り跡を予約する
-    const walking = this.view.script !== undefined || this.live;
+    const walking = this.view.script !== undefined || this.view.route !== undefined || this.live;
     if (walking) {
       // 実操作モードでは筋書きより実操作を優先する
-      const input = this.live ? this.liveInput : this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : IDLE_INPUT;
+      const input = this.live ? this.liveInput
+        : this.view.route ? this.walker.routeInput(this.view.routeRun === true)
+        : this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : IDLE_INPUT;
       // 歩き手は位置と向きだけを持つ。足跡は歩幅で機械的に打たず、
       // 人物の足が実際に地面に着いた瞬間・着いた位置に打つ（フェーズ6 段階3）
       this.walker.step(input, FIXED_DT, this.groundHeight);
@@ -2277,7 +2280,12 @@ export class WorldScene implements SceneRenderer {
       passProfile: this.passProfile,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
-      walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
+      walker: {
+        x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera,
+        routeReached: this.walker.routeReached, routeDone: this.walker.routeDone(),
+        routeDistance: Number(this.walker.routeDistance.toFixed(1)),
+        routeTotal: this.view.route ? this.view.route.length : 0,
+      },
       figure: { vertices: this.figureVerts, ...this.figure.stats },
       matL0: this.matL0 ? (() => {
         const h = new Array(11).fill(0);
