@@ -53,7 +53,8 @@ fn fsTree(in: TVSOut) -> @location(0) vec4f {
     let n = select(in.normal, -in.normal, dot(in.normal, v) < 0.0);
     let sun = frame.sunDir.xyz;
     let bark = vec3f(0.22, 0.16, 0.11) * (0.8 + 0.4 * gnoise(vec2f(in.uv.x * 12.0, in.world.y * 3.0), 601u));
-    color = bark * (max(dot(n, sun), 0.0) * sunLightAt(in.world.y) * in.shade + skyAmbient(n));
+    // 幹は枝葉に覆われて空が見えにくい
+    color = bark * (max(dot(n, sun), 0.0) * sunLightAt(in.world.y) * in.shade + skyAmbient(n) * 0.62);
     let air = aerialLut(-v, length(toCam));
     color = color * air.transmittance + air.inscatter;
   } else if (kind == 1u) {
@@ -65,7 +66,7 @@ fn fsTree(in: TVSOut) -> @location(0) vec4f {
     if (nz * envelope < 0.13 + 0.16 * y) { discard; }
     // 樹冠の内側（根元側）は暗い
     let occ = 0.45 + 0.55 * y;
-    color = leafShade(in.world, in.normal, vec3f(0.05, 0.12, 0.05) * occ, vec3f(0.12, 0.30, 0.08), in.shade, 2.5);
+    color = leafShade(in.world, in.normal, vec3f(0.05, 0.12, 0.05) * occ, vec3f(0.12, 0.30, 0.08), in.shade, 2.5, occ);
   } else {
     // 広葉樹の葉塊: 丸い輪郭の中に、葉の房（高周波）の隙間を空けて板に見せない
     let d = length(in.uv - 0.5) * 2.0;
@@ -74,7 +75,7 @@ fn fsTree(in: TVSOut) -> @location(0) vec4f {
     let leafy = 0.55 * big + 0.45 * fine;
     if (d > 0.55 + 0.45 * big || leafy < 0.30 + 0.25 * d) { discard; }
     let occ = 0.55 + 0.45 * smoothstep(0.9, 0.2, d);
-    color = leafShade(in.world, in.normal, vec3f(0.08, 0.20, 0.05) * occ, vec3f(0.28, 0.55, 0.12), in.shade, 1.2);
+    color = leafShade(in.world, in.normal, vec3f(0.08, 0.20, 0.05) * occ, vec3f(0.28, 0.55, 0.12), in.shade, 1.2, occ);
   }
   return vec4f(color, 1.0);
 }

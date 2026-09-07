@@ -98,6 +98,8 @@ struct GVSOut {
   @location(2) uv: vec2f,
   @location(3) shade: f32,
   @location(4) dry: f32,
+  @location(5) thick: f32,
+  @location(6) side: vec3f,
 };
 
 const G_BLADES: u32 = 5u;
@@ -148,10 +150,13 @@ fn vsGrassNear(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32)
   var out: GVSOut;
   out.pos = frame.viewProj * vec4f(world - frame.camPos.xyz, 1.0);
   out.world = world;
-  out.normal = normalize(cross(side, tangent));
+  // 葉を樋状に（縁ほど外向き）。1 枚の中で明暗が連続的に変わる
+  out.normal = normalize(cross(side, tangent) + side * (sideSign * 0.6));
   out.uv = vec2f(sideSign, up);
   out.shade = inst.attr.z;
   out.dry = dry;
+  out.thick = 0.6 + 0.8 * bh;
+  out.side = side;
   return out;
 }
 
@@ -177,6 +182,8 @@ fn vsGrassMid(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   out.uv = vec2f(sx, up);
   out.shade = inst.attr.z;
   out.dry = inst.attr.w;
+  out.thick = 1.0;
+  out.side = side;
   return out;
 }
 
@@ -189,7 +196,7 @@ fn grassColor(uvY: f32, dry: f32) -> vec3f {
 @fragment
 fn fsGrassNear(in: GVSOut) -> @location(0) vec4f {
   let trans = mix(vec3f(0.30, 0.60, 0.12), vec3f(0.65, 0.50, 0.18), in.dry);
-  let color = leafShade(in.world, in.normal, grassColor(in.uv.y, in.dry), trans, in.shade, 0.8);
+  let color = leafShade(in.world, in.normal, grassColor(in.uv.y, in.dry), trans, in.shade, in.thick * (1.2 - 0.5 * in.uv.y), 0.26 + 0.74 * in.uv.y);
   return vec4f(color, 1.0);
 }
 
@@ -201,7 +208,10 @@ fn fsGrassMid(in: GVSOut) -> @location(0) vec4f {
   let strands = 0.5 + 0.5 * sin(x * 17.0 + sin(x * 5.0 + in.dry * 3.0) * 2.5);
   let heights = 0.55 + 0.45 * sin(x * 9.0 + 1.7);
   if (strands < 0.35 + 0.5 * y || y > heights) { discard; }
+  // 筋ごとに法線を振る（面で均一に光らせない）
+  let tilt = cos(x * 17.0 + sin(x * 5.0 + in.dry * 3.0) * 2.5);
+  let n = normalize(in.normal + in.side * (tilt * 0.6));
   let trans = mix(vec3f(0.30, 0.60, 0.12), vec3f(0.65, 0.50, 0.18), in.dry);
-  let color = leafShade(in.world, in.normal, grassColor(y, in.dry) * 0.85, trans, in.shade, 1.2);
+  let color = leafShade(in.world, n, grassColor(y, in.dry) * 0.85, trans, in.shade, 1.15 * (1.2 - 0.45 * y), 0.32 + 0.68 * y);
   return vec4f(color, 1.0);
 }

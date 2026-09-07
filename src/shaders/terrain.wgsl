@@ -43,6 +43,31 @@ struct FSOut {
   @location(0) color: vec4f,
 };
 
+/**
+ * 地面の細かい凹凸。高さテクスチャは 0.25m テクセルなので、それより細かい起伏は法線で足す。
+ * 高さそのものは変えない（変形の場や当たり判定と食い違わせないため）。近距離でのみ効かせる。
+ */
+fn detailBump(p: vec2f, kind: u32) -> f32 {
+  switch (kind) {
+    // 太陽が仰角 3.5° と低いので、わずかな傾きが大きな明暗になる。振幅は控えめに
+    case 3u, 7u: {   // 土の道・集落の敷地: 踏み固めた土の細かい凹凸
+      return 0.0035 * gnoise(p * 6.0, 701u) + 0.0016 * gnoise(p * 17.0, 702u);
+    }
+    case 1u: {       // 田の泥: 濡れた泥のうねり（粗く、なだらか）
+      return 0.0030 * gnoise(p * 4.5, 703u);
+    }
+    case 8u: {       // 境内: 玉砂利の粒
+      return 0.0014 * gnoise(p * 24.0, 704u) + 0.0009 * gnoise(p * 55.0, 705u);
+    }
+    case 4u: {       // 川床: 石まじり
+      return 0.0040 * gnoise(p * 8.0, 706u);
+    }
+    default: {       // 草地・畦・丘: 株の根元の起伏
+      return 0.0050 * gnoise(p * 3.5, 707u) + 0.0024 * gnoise(p * 11.0, 708u);
+    }
+  }
+}
+
 @fragment
 fn fs(in: VSOut) -> FSOut {
   let p = in.world.xz;
@@ -64,6 +89,16 @@ fn fs(in: VSOut) -> FSOut {
   // 変形の沈みで法線も傾ける（高さだけ変えると、へこんでいるのに陰影が平らなまま）
   let sg = deformSinkGradient(p);
   n = normalize(vec3f(n.x + sg.x * n.y, n.y, n.z + sg.y * n.y));
+  // 細部の凹凸で法線を傾ける（近距離のみ。遠くでは画素より細かくなりエイリアスになる）
+  let detailFade = 1.0 - smootherstep(7.0, 28.0, dist);
+  if (detailFade > 0.0 && dbg != 17.0) {   // 計測用 dbg=17: 細部の凹凸なし
+    let e = max(0.035, pixelSize);
+    let b0 = detailBump(p, baked.kind);
+    let bx = detailBump(p + vec2f(e, 0.0), baked.kind);
+    let bz = detailBump(p + vec2f(0.0, e), baked.kind);
+    n = normalize(n + vec3f((b0 - bx) / e, 0.0, (b0 - bz) / e) * detailFade);
+  }
+
   let df = deformAt(p);
   var albedo = baked.albedo;
   // 踏み固めた土は湿って暗く見える（道の沈みは 2cm 程度で陰影だけでは見えにくい）
@@ -74,8 +109,13 @@ fn fs(in: VSOut) -> FSOut {
   // 太陽光: 高度ごとの透過後の色（1D LUT）× 地形の影
   let sunLight = sunLightAt(in.world.y);
   let shadow = select(baked.shadow, terrainShadow(in.world, sun), dbg == 8.0);   // 計測用 dbg=8: 影を行進で直接計算
+  // 遮蔽による陰り: 畦・道の際は両側に壁があり、草に覆われた地面は葉に遮られて空が見えにくい
+  var ao = 0.60 + 0.40 * smootherstep(0.0, 1.1, baked.ridgeDist);
+  if (baked.kind == 0u || baked.kind == 2u || baked.kind == 5u) { ao *= 0.78; }
+  if (baked.kind == 1u) { ao *= 0.86; }   // 田の泥は稲に囲まれる
+  if (dbg == 18.0) { ao = 1.0; }          // 計測・比較用 dbg=18: 遮蔽なし
   let ambient = skyAmbient(n);
-  var color = albedo * (ndl * shadow * sunLight + ambient);
+  var color = albedo * (ndl * shadow * sunLight + ambient * ao);
 
   // 遠くの田（110m 超）は水面と株を描かず、地形の側で稲の面として描く（水面は 170m 超で discard する）。
   // 風の場で明暗が渡る＝田の面を風が渡る画。近くは水面＋株が上に重なる

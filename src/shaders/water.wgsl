@@ -91,7 +91,9 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let stirred = vec3f(0.30, 0.24, 0.13) * ambient * 0.9;
   under = mix(under, stirred, df.turbidity * 0.75);
 
-  var color = mix(under, refl, fresnel);
+  // 畦の際は水面も空が見えにくい（映り込みが弱まり、水底の色が出る）
+  let edgeAo = 0.55 + 0.45 * smootherstep(0.0, 1.4, baked.ridgeDist);
+  var color = mix(under * edgeAo, refl, fresnel * (0.35 + 0.65 * edgeAo));
 
   // 遠景の溶け込み（3D LUT）
   let air = aerialLut(-v, dist);

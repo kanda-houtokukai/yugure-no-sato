@@ -111,6 +111,8 @@ struct VSOut {
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,        // x = 葉の幅方向 -1..1, y = 根元 0 → 先端 1
   @location(3) shade: f32,       // 株元の日向/日陰
+  @location(4) thick: f32,       // 葉の厚みの個体差（透けの強さ）
+  @location(5) side: vec3f,      // 葉の幅方向の軸（面内で法線を曲げるのに使う）
 };
 
 const BLADES: u32 = 7u;
@@ -159,9 +161,13 @@ fn vsNear(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> V
   var out: VSOut;
   out.pos = frame.viewProj * vec4f(world - frame.camPos.xyz, 1.0);
   out.world = world;
-  out.normal = normalize(cross(side, tangent));
+  // 葉は平らな板でなく、中央がへこんだ樋状。縁ほど外を向くよう法線を曲げる
+  // （頂点間で補間されるので、1 枚の中で明暗が連続的に変わる）
+  out.normal = normalize(cross(side, tangent) + side * (sideSign * 0.55));
   out.uv = vec2f(sideSign, up);
   out.shade = inst.attr.z;
+  out.thick = 0.7 + 0.7 * bh;      // 葉ごとに厚みが違う＝透けの強さが違う
+  out.side = side;
   return out;
 }
 
@@ -187,11 +193,16 @@ fn vsMid(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VS
   out.normal = normalize(cross(side, vec3f(0.0, 1.0, 0.0)));
   out.uv = vec2f(sx, up);
   out.shade = inst.attr.z;
+  out.thick = 1.0;
+  out.side = side;
   return out;
 }
 
-/** 葉の色と逆光の透け。稲・草で共通の考え方 */
-fn leafShade(world: vec3f, n0: vec3f, albedo: vec3f, transColor: vec3f, shade: f32, thickness: f32) -> vec3f {
+/**
+ * 葉の色と逆光の透け。稲・草・木で共通。
+ * ao = 遮蔽（0..1）。株元や葉の茂みの内側は空が見えにくいので環境光を落とす。
+ */
+fn leafShade(world: vec3f, n0: vec3f, albedo: vec3f, transColor: vec3f, shade: f32, thickness: f32, ao: f32) -> vec3f {
   let toCam = frame.camPos.xyz - world;
   let v = normalize(toCam);
   let sun = frame.sunDir.xyz;
@@ -204,7 +215,7 @@ fn leafShade(world: vec3f, n0: vec3f, albedo: vec3f, transColor: vec3f, shade: f
   let back = max(dot(-n, sun), 0.0);
   let toward = pow(max(dot(v, -sun), 0.0), 3.0);
   let trans = (0.12 * back + 0.30 * toward * back) / thickness;
-  var color = albedo * (diffuse * sunLight + ambient) + transColor * trans * sunLight;
+  var color = albedo * (diffuse * sunLight + ambient * ao) + transColor * trans * sunLight;
   let dist = length(toCam);
   let air = aerialLut(-v, dist);
   return color * air.transmittance + air.inscatter;
@@ -214,7 +225,9 @@ fn leafShade(world: vec3f, n0: vec3f, albedo: vec3f, transColor: vec3f, shade: f
 fn fsNear(in: VSOut) -> @location(0) vec4f {
   // 根元は暗く、先端へ明るい黄緑
   let g = mix(vec3f(0.05, 0.14, 0.03), vec3f(0.12, 0.34, 0.07), in.uv.y);
-  let color = leafShade(in.world, in.normal, g, vec3f(0.22, 0.55, 0.10), in.shade, 1.0);
+  // 先端ほど薄く透ける。株元は隣の株と水面に囲まれて空が見えにくい
+  let thickness = in.thick * (1.25 - 0.55 * in.uv.y);
+  let color = leafShade(in.world, in.normal, g, vec3f(0.22, 0.55, 0.10), in.shade, thickness, 0.28 + 0.72 * in.uv.y);
   return vec4f(color, 1.0);
 }
 
@@ -226,8 +239,12 @@ fn fsMid(in: VSOut) -> @location(0) vec4f {
   let strands = 0.5 + 0.5 * sin(x * 21.0 + sin(x * 7.0) * 2.0);
   let taper = 1.0 - y * y;
   if (strands * taper < 0.42 + 0.5 * y) { discard; }
+  // 板でも 1 本ずつ向きを変える: 筋の位相で法線を左右に振り、面で均一に光らないようにする
+  let tilt = cos(x * 21.0 + sin(x * 7.0) * 2.0);
+  let n = normalize(in.normal + in.side * (tilt * 0.55));
   // 板は面で日を受けて株より明るくなりがちなので、色を落として揃える
   let g = mix(vec3f(0.04, 0.11, 0.025), vec3f(0.08, 0.24, 0.05), y);
-  let color = leafShade(in.world, in.normal, g, vec3f(0.18, 0.45, 0.08), in.shade, 1.6);
+  let thickness = 1.5 * (1.2 - 0.45 * y);
+  let color = leafShade(in.world, n, g, vec3f(0.18, 0.45, 0.08), in.shade, thickness, 0.34 + 0.66 * y);
   return vec4f(color, 1.0);
 }
