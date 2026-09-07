@@ -214,7 +214,7 @@ fn leafShade(world: vec3f, n0: vec3f, albedo: vec3f, transColor: vec3f, shade: f
   // 透過: 太陽が葉の裏にあり、視線がそちらを向くほど強い（逆光の縁が光る）
   let back = max(dot(-n, sun), 0.0);
   let toward = pow(max(dot(v, -sun), 0.0), 3.0);
-  let trans = (0.12 * back + 0.30 * toward * back) / thickness;
+  let trans = (0.17 * back + 0.44 * toward * back) / thickness;   // 逆光の透け。弱いと稲が黒く沈む（前後比較で判定）
   var color = albedo * (diffuse * sunLight + ambient * ao) + transColor * trans * sunLight;
   let dist = length(toCam);
   let air = aerialLut(-v, dist);
