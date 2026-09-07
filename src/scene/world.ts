@@ -27,7 +27,10 @@ import postWgsl from '../shaders/post.wgsl?raw';
 import detailWgsl from '../shaders/detail.wgsl?raw';
 import detailBakeWgsl from '../shaders/detail-bake.wgsl?raw';
 import detailSampleWgsl from '../shaders/detail-sample.wgsl?raw';
+import buildingWgsl from '../shaders/building.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
+import { VERTEX_FLOATS } from './mesh';
+import { BARN_DEFAULT, FARMHOUSE_DEFAULT, STOREHOUSE_DEFAULT, buildFarmhouse, type FarmhouseParams } from './buildings';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
 import type { DeviceBundle } from '../gpu/device';
@@ -208,6 +211,9 @@ export class WorldScene implements SceneRenderer {
   private treePipeline!: GPURenderPipeline;
   private treeDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
   private treeStats = { total: 0, variants: [] as { name: string; vertices: number; instances: number }[] };
+  private buildingPipeline!: GPURenderPipeline;
+  private buildingDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
+  private buildingStats = { total: 0, kinds: [] as { name: string; vertices: number; instances: number }[] };
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -314,6 +320,8 @@ export class WorldScene implements SceneRenderer {
     await this.buildWater();
     // --- 木（テンプレートを数値から起こし、配置を正本に問い合わせて確定） ---
     await this.buildTrees();
+    // --- 建物（同じく数値から。敷地・境内に建てる） ---
+    await this.buildBuildings();
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -726,6 +734,41 @@ export class WorldScene implements SceneRenderer {
         },
         fragment: { module: treeModule, entryPoint: 'fsTree', targets: [{ format: 'rgba16float' }] },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+        multisample: { count: MSAA_SAMPLES },
+      });
+    }
+
+    // --- 建物（木と同じ頂点フォーマット・同じインスタンス形式） ---
+    {
+      const common = worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + lightsampleWgsl + windWgsl + deformWgsl;
+      const buildingModule = await this.makeModule('building', common + buildingWgsl);
+      this.buildingPipeline = device.createRenderPipeline({
+        label: 'building', layout: frameAndHeight,
+        vertex: {
+          module: buildingModule, entryPoint: 'vsBuilding',
+          buffers: [
+            {
+              arrayStride: VERTEX_FLOATS * 4, stepMode: 'vertex',
+              attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                { shaderLocation: 1, offset: 12, format: 'float32x3' },
+                { shaderLocation: 2, offset: 24, format: 'float32x2' },
+                { shaderLocation: 3, offset: 32, format: 'float32' },
+                { shaderLocation: 4, offset: 36, format: 'float32' },
+              ],
+            },
+            {
+              arrayStride: 32, stepMode: 'instance',
+              attributes: [
+                { shaderLocation: 5, offset: 0, format: 'float32x4' },
+                { shaderLocation: 6, offset: 16, format: 'float32x4' },
+              ],
+            },
+          ],
+        },
+        fragment: { module: buildingModule, entryPoint: 'fsBuilding', targets: [{ format: 'rgba16float' }] },
+        primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
         depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
         multisample: { count: MSAA_SAMPLES },
       });
@@ -1232,6 +1275,61 @@ export class WorldScene implements SceneRenderer {
     });
   }
 
+  /** 建物: テンプレートを数値から起こし、敷地の高さを正本に問い合わせて据える */
+  private async buildBuildings(): Promise<void> {
+    const device = this.device;
+    // 集落の敷地（谷座標 中心 (0,-132)・半幅 66×26）に建てる。主道は u≈0 を南北に走る。
+    // 道の西側（u<0）の家は東（+X）を向く（θ=-90°）、東側（u>0）の家は西（-X）を向く（θ=+90°）。
+    // 整列させないよう、向きを ±10° 振る。茅葺きは主道から見える中心に置く（[DECISION]）
+    const deg = (d: number): number => (d * Math.PI) / 180;
+    const plan: { kind: 'thatch' | 'house' | 'barn' | 'storehouse'; u: number; v: number; rot: number; scale: number }[] = [
+      { kind: 'thatch', u: -14, v: -129, rot: deg(-84), scale: 1.0 },   // 主道の西、集落の中心
+      { kind: 'house', u: 14, v: -136, rot: deg(86), scale: 0.95 },
+      { kind: 'house', u: -16, v: -147, rot: deg(-98), scale: 0.88 },
+      { kind: 'barn', u: 13, v: -122, rot: deg(66), scale: 1.0 },
+      { kind: 'barn', u: 24, v: -147, rot: deg(108), scale: 0.92 },
+      { kind: 'storehouse', u: -27, v: -136, rot: deg(-64), scale: 1.0 },
+    ];
+    const rz = new Float32Array(await this.runQuery('riverQuery', [
+      { binding: 6, data: new Float32Array(plan.map((b) => b.u)), type: 'read-only-storage' },
+    ], { binding: 7, byteLength: plan.length * 4 }, Math.ceil(plan.length / 64)));
+    const xz = plan.map((b, i) => [b.u, b.v + rz[i]] as [number, number]);
+    const heights = await this.queryHeights(this.queryModule, xz);
+
+    const thatchParams: FarmhouseParams = {
+      ...FARMHOUSE_DEFAULT,
+      width: 11.6, depth: 8.0,
+      eaveHeight: 2.9, ridgeHeight: 7.6,   // 茅は水を切るため急勾配（約 45°）
+      eaveOut: 1.0, gableOut: 0.5,
+      roof: 'thatch', thatchThickness: 0.55,
+    };
+    // テンプレートは種類ごとに 1 つだけ作り、値を変えて使い回す
+    const templates: Record<string, Float32Array> = {
+      thatch: buildFarmhouse(202, thatchParams),
+      house: buildFarmhouse(101, FARMHOUSE_DEFAULT),
+      barn: buildFarmhouse(303, BARN_DEFAULT),
+      storehouse: buildFarmhouse(404, STOREHOUSE_DEFAULT),
+    };
+    this.buildingDraws = [];
+    const kindsStat: { name: string; vertices: number; instances: number }[] = [];
+    for (const [name, mesh] of Object.entries(templates)) {
+      const mine = plan.map((b, i) => (b.kind === name ? i : -1)).filter((i) => i >= 0);
+      if (mine.length === 0) continue;
+      const inst = new Float32Array(mine.length * 8);
+      mine.forEach((i, k) => {
+        inst.set([xz[i][0], heights[i], xz[i][1], plan[i].scale, plan[i].rot, 0, 0, 0], k * 8);
+      });
+      const meshBuf = device.createBuffer({ size: mesh.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(meshBuf, 0, mesh);
+      const instBuf = device.createBuffer({ size: inst.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(instBuf, 0, inst);
+      const vertexCount = mesh.length / VERTEX_FLOATS;
+      this.buildingDraws.push({ mesh: meshBuf, vertexCount, instances: instBuf, instanceCount: mine.length, name });
+      kindsStat.push({ name, vertices: vertexCount, instances: mine.length });
+    }
+    this.buildingStats = { total: plan.length, kinds: kindsStat };
+  }
+
   /** 世界の方向 → 画素座標（画面外なら null） */
   dirToPixel(dir: Vec3): { x: number; y: number } | null {
     const { forward, right, up, tanHalfFov } = this.cameraBasis;
@@ -1549,6 +1647,13 @@ export class WorldScene implements SceneRenderer {
       scene.setVertexBuffer(1, d.instances);
       scene.draw(d.vertexCount, d.instanceCount);
     }
+    // 1f. 建物
+    scene.setPipeline(this.buildingPipeline);
+    for (const d of this.buildingDraws) {
+      scene.setVertexBuffer(0, d.mesh);
+      scene.setVertexBuffer(1, d.instances);
+      scene.draw(d.vertexCount, d.instanceCount);
+    }
     scene.end();
 
     // 2. 空（地形の無い画素だけ）
@@ -1634,6 +1739,7 @@ export class WorldScene implements SceneRenderer {
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },
       trees: this.treeStats,
+      buildings: this.buildingStats,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
