@@ -163,6 +163,10 @@ const YARD_FEATHER: f32 = 7.5;                  // 縁の傾斜の幅 [m]。広�
 const PRECINCT_C: vec2f = vec2f(0.0, 270.0);    // 神社の境内
 const PRECINCT_H: vec2f = vec2f(34.0, 24.0);
 const PRECINCT_FEATHER: f32 = 8.0;              // 石段が上がる斜面の幅
+// 谷の出口の小さな集落（隣村）。既存より小さく、川に沿って東西に並ぶ
+const HAMLET_C: vec2f = vec2f(-455.0, 42.0);
+const HAMLET_H: vec2f = vec2f(27.0, 14.0);
+const HAMLET_FEATHER: f32 = 6.5;
 // 峠の見晴らし場。上りきったところに立ち止まる理由を置く（東屋・大石）
 const LOOKOUT_C: vec2f = vec2f(214.0, 379.0);
 const LOOKOUT_H: vec2f = vec2f(10.0, 7.0);
@@ -179,6 +183,9 @@ fn flatMask(uv: vec2f, center: vec2f, half: vec2f, feather: f32, seed: u32) -> f
 
 /** 敷地の高さ: 隣の田より約 1m 高い平場 */
 fn yardLevel() -> f32 { return valleyFloor(YARD_C) + 0.85; }
+
+/** 隣村の敷地の高さ: 田より一段高い平場（本村と同じ考え方だが低め） */
+fn hamletLevel() -> f32 { return valleyFloor(HAMLET_C) + 0.62; }
 
 /** 峠の見晴らし場の高さ: 峠道の路面と同じ高さ（道から段差なく入れる） */
 fn lookoutLevel() -> f32 { return smoothLand(passNode(5)) + 0.12; }
@@ -200,6 +207,8 @@ fn flatSite(uv: vec2f) -> FlatSite {
   if (wp > f.w) { f.w = wp; f.level = precinctLevel(); f.kind = KIND_PRECINCT; }
   let wl = flatMask(uv, LOOKOUT_C, LOOKOUT_H, LOOKOUT_FEATHER, 133u);
   if (wl > f.w) { f.w = wl; f.level = lookoutLevel(); f.kind = KIND_TRAIL; }
+  let wh = flatMask(uv, HAMLET_C, HAMLET_H, HAMLET_FEATHER, 134u);
+  if (wh > f.w) { f.w = wh; f.level = hamletLevel(); f.kind = KIND_YARD; }
   return f;
 }
 
@@ -316,6 +325,14 @@ fn nearestPath(uv: vec2f, floorH: f32) -> PathHit {
   }
   if (uv.y > RIVER_BAND - 1.0 && uv.y < 150.0) {
     considerPath(&best, abs(uv.x - lineB(5, uv.y)), 0.7, floorH + 0.42);
+  }
+  // 川沿いの道（北岸）。橋のたもとから西へ、谷の出口の集落まで続く
+  if (uv.x > -560.0 && uv.x < 240.0) {
+    considerPath(&best, abs(uv.y - lineA(1, uv.x)), 0.75, floorH + 0.42);
+  }
+  // 隣村へ上がる短い枝道（川沿いの道 → 集落）
+  if (uv.x > -500.0 && uv.x < -400.0 && uv.y > 0.0 && uv.y < 50.0) {
+    considerPath(&best, segDist(uv, vec2f(-448.0, 8.0), vec2f(-455.0, 40.0)), 0.7, floorH + 0.42);
   }
   // 峠へ向かう枝道。主道（u≈0）の v=150 あたりから北東へ、峠の麓（150, 235）まで
   if (uv.x > -10.0 && uv.x < 165.0 && uv.y > 140.0 && uv.y < 250.0) {

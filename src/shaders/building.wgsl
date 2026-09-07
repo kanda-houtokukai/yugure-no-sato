@@ -239,6 +239,16 @@ fn fsBuilding(in: BVSOut) -> @location(0) vec4f {
     albedo = vec3f(0.24, 0.228, 0.205) * (0.88 + 0.20 * grain);
     ao = 0.70;
     thatchRim = 2.4; rimEdge = 0.22;
+  } else if (kind == 21u) {  // 苔むした石: 灰緑。北面と窪みに苔が濃く乗る
+    let moss = gnoise(in.uv * 2.6, 861u) * 0.5 + 0.5;
+    let grit = gnoise(in.uv * 14.0, 862u) * 0.5 + 0.5;
+    let stone = mix(vec3f(0.135, 0.130, 0.120), vec3f(0.215, 0.208, 0.192), grit);
+    let green = mix(vec3f(0.052, 0.085, 0.038), vec3f(0.098, 0.140, 0.062), moss);
+    // 上向きの面ほど苔が乗る
+    albedo = mix(stone, green, smootherstep(0.15, 0.85, moss) * (0.35 + 0.65 * max(n.y, 0.0)));
+    n = normalize(n + tangentOf(n) * (grit - 0.5) * 0.22);
+    ao = 0.74;
+    spec = 0.02; rough = 0.7;
   } else {                   // 石
     albedo = mix(vec3f(0.145, 0.138, 0.128), vec3f(0.235, 0.225, 0.210), grain);
     ao = 0.8;

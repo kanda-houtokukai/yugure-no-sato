@@ -36,7 +36,7 @@ import {
   type FarmhouseParams,
 } from './buildings';
 import {
-  buildDryingRack, buildShelter, buildStones, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
+  buildBridge, buildDryingRack, buildShelter, buildStoneShrine, buildStones, buildWayStone, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
 } from './props';
 import { Figure } from './figure';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
@@ -1417,6 +1417,10 @@ export class WorldScene implements SceneRenderer {
     const passPts: [number, number][] = [];
     for (const v of [175, 250, 290, 330, 360, 395, 430, 470]) passPts.push([210, v]);
     for (const u of [0, 100, 210, 320, 430]) passPts.push([u, 395]);
+    // 川を渡るところ（橋の設計用）: u=0 の主道上で v を振る
+    for (const v of [-12, -9, -7, -6.5, -5, -3, 0, 3, 5, 6.5, 7, 9, 12]) passPts.push([0, v]);
+    // 隣の集落の候補地（谷の出口・西）
+    for (const u of [-380, -430, -470, -510]) for (const v of [-70, -40, 30, 60]) passPts.push([u, v]);
     {
       const rz = new Float32Array(await this.runQuery('riverQuery', [
         { binding: 6, data: new Float32Array(passPts.map((q) => q[0])), type: 'read-only-storage' },
@@ -1490,7 +1494,7 @@ export class WorldScene implements SceneRenderer {
     // 道の西側（u<0）の家は東（+X）を向く（θ=-90°）、東側（u>0）の家は西（-X）を向く（θ=+90°）。
     // 整列させないよう、向きを ±10° 振る。茅葺きは主道から見える中心に置く（[DECISION]）
     const deg = (d: number): number => (d * Math.PI) / 180;
-    const plan: { kind: string; u: number; v: number; rot: number; scale: number; lift?: number }[] = [
+    const plan: { kind: string; u: number; v: number; rot: number; scale: number; lift?: number; snapRoad?: boolean }[] = [
       { kind: 'thatch', u: -14, v: -129, rot: deg(-84), scale: 1.0 },   // 主道の西、集落の中心
       { kind: 'house', u: 14, v: -136, rot: deg(86), scale: 0.95 },
       { kind: 'house', u: -16, v: -147, rot: deg(-98), scale: 0.88 },
@@ -1557,6 +1561,26 @@ export class WorldScene implements SceneRenderer {
       { kind: 'shelter', u: 218, v: 383, rot: deg(184), scale: 1.0 },   // 里（南）を向いて座れる
       { kind: 'stones', u: 207, v: 374, rot: deg(24), scale: 1.35 },
       { kind: 'stones', u: 222, v: 373, rot: deg(-52), scale: 0.9 },
+      // 主道が川を渡るところ。これまでは浅瀬で、道が岸で途切れていた（残した粗）
+      { kind: 'bridge', u: 0, v: -9, rot: 0, scale: 1.0, snapRoad: true },
+      // --- 隣の集落（谷の出口・西）。本村より小さく、川に沿って東西に並ぶ。
+      //     茅葺きは置かない（本村の茅葺き母屋を「この里で一番古い家」として特別なままにする）
+      { kind: 'house', u: -468, v: 46, rot: deg(4), scale: 0.86 },
+      { kind: 'barn', u: -447, v: 38, rot: deg(-96), scale: 0.84 },
+      { kind: 'storehouse', u: -432, v: 48, rot: deg(10), scale: 0.9 },
+      { kind: 'wall10', u: -460, v: 30, rot: deg(-4), scale: 1.0 },
+      { kind: 'wall10', u: -438, v: 29.5, rot: deg(3), scale: 1.0 },
+      { kind: 'wood', u: -472, v: 39, rot: deg(94), scale: 0.9 },
+      { kind: 'rack', u: -424, v: 40, rot: deg(88), scale: 0.85 },
+      { kind: 'veg2', u: -455, v: 52, rot: deg(-86), scale: 1.0 },
+      { kind: 'vessels', u: -462, v: 40, rot: deg(50), scale: 0.95 },
+      { kind: 'stones', u: -445, v: 46, rot: deg(18), scale: 0.85 },
+      // --- 山中の祠（峠道の 2 つ目の折り返しの脇）と、辻の道祖神 ---
+      { kind: 'shrineStone', u: 152.9, v: 303.1, rot: deg(196), scale: 1.0 },   // 峠道の路肩（道から 3.2m）
+      { kind: 'wayStone', u: 6, v: 148, rot: deg(28), scale: 1.0 },       // 峠への分岐の辻
+      { kind: 'wayStone', u: 1, v: -13, rot: deg(-8), scale: 0.9 },       // 橋のたもと
+      { kind: 'wayStone', u: -446, v: 12, rot: deg(64), scale: 0.95 },    // 隣村への分岐
+      { kind: 'wayStone', u: 152, v: 238, rot: deg(-24), scale: 0.9 },    // 峠の登り口
     ];
     // 石段の勾配は地形から決める（決め打ちだと埋まるか浮く）。下端と上端の高さを正本に問い合わせる
     const stairV0 = 240;
@@ -1566,6 +1590,18 @@ export class WorldScene implements SceneRenderer {
       { binding: 6, data: new Float32Array(probeU), type: 'read-only-storage' },
     ], { binding: 7, byteLength: probeU.length * 4 }, Math.ceil(probeU.length / 64)));
     const xz = plan.map((b, i) => [b.u, b.v + rzAll[i]] as [number, number]);
+    // 主道は ±2.2m 蛇行するので、道の上に置くものは正本に問い合わせて x を合わせる
+    const snapIdx2 = plan.map((b, i) => (b.snapRoad ? i : -1)).filter((i) => i >= 0);
+    if (snapIdx2.length > 0) {
+      const q = new Float32Array(snapIdx2.length * 4);
+      const off = new Float32Array(snapIdx2.length);
+      snapIdx2.forEach((i, k) => q.set([0, 0, 0, xz[i][1]], k * 4));
+      const snapped = new Float32Array(await this.runQuery('snapQuery', [
+        { binding: 4, data: q, type: 'read-only-storage' },
+        { binding: 8, data: off, type: 'read-only-storage' },
+      ], { binding: 5, byteLength: snapIdx2.length * 8 }, Math.ceil(snapIdx2.length / 64)));
+      snapIdx2.forEach((i, k) => { xz[i][0] = snapped[k * 2]; });
+    }
     const stairPts: [number, number][] = [
       [0, stairV0 + rzAll[plan.length]],
       [0, stairV1 + rzAll[plan.length + 1]],
@@ -1605,6 +1641,9 @@ export class WorldScene implements SceneRenderer {
       vessels: buildVessels(551),
       stones: buildStones(561),
       shelter: buildShelter(571),
+      bridge: buildBridge(581, 18.0, 2.6),
+      shrineStone: buildStoneShrine(591),
+      wayStone: buildWayStone(601),
     };
     this.buildingDraws = [];
     const kindsStat: { name: string; vertices: number; instances: number }[] = [];

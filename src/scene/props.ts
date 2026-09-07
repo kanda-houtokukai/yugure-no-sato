@@ -14,6 +14,7 @@ export const MAT_SPLITWOOD = 13;
 export const MAT_SOIL = 14;
 export const MAT_METAL = 15;
 export const MAT_LOG = 16;      // 薪の側面（樹皮）。柱の黒い木より明るい
+export const MAT_MOSSY = 21;    // 苔むした石（祠・古い石段）
 
 /** 円板（筒の蓋）。薪の木口・桶の底に使う */
 function disc(m: MeshBuilder, center: V3, normal: V3, r: number, sides: number, kind: number): void {
@@ -412,5 +413,140 @@ export function buildShelter(seed: number): Float32Array {
     const z = -D / 2 + 0.42 + i * 0.28;
     m.box([0, bh + 0.03, z], [W - 0.3, 0.045, 0.24], MAT_DECK);
   }
+  return m.toFloat32Array();
+}
+
+/**
+ * 木の橋。丸太の桁に板を並べ、川の中に 2 基の橋脚を立て、簡素な欄干を付ける。
+ * 原点は手前の岸の地面、+Z が対岸の向き。橋脚は川床まで届くよう長めにして埋める。
+ */
+export function buildBridge(seed: number, span: number, width: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const hw = width / 2;
+  const deck = 0.16;                 // 岸の地面から桁の上端まで
+  const arch = 0.30;                 // 中央のふくらみ
+  const deckY = (t: number): number => deck + arch * Math.sin(Math.PI * t);
+  // 桁（丸太 3 本）。ふくらみを出すため区間に分ける
+  const seg = 12;
+  for (const sx of [-1, 0, 1]) {
+    const x = sx * (hw - 0.18);
+    for (let i = 0; i < seg; i++) {
+      const t0 = i / seg, t1 = (i + 1) / seg;
+      m.tube([x, deckY(t0) - 0.11, t0 * span], [x, deckY(t1) - 0.11, t1 * span], 0.105, 0.105, 6, MAT_POST);
+    }
+  }
+  // 床板。少しずつ隙間を空け、板ごとに厚みと色をばらす
+  const planks = Math.round(span / 0.30);
+  for (let i = 0; i < planks; i++) {
+    const t = (i + 0.5) / planks;
+    const z = t * span;
+    const th = 0.045 + 0.012 * r();
+    m.box([(r() - 0.5) * 0.03, deckY(t) + th / 2, z], [width - 0.05 * r(), th, 0.30 - 0.045], MAT_DECK);
+  }
+  // 橋脚（2 基）。川の中に立つので長く伸ばし、川床に埋める
+  for (const t of [0.31, 0.69]) {
+    const z = t * span;
+    const y = deckY(t) - 0.22;
+    for (const sx of [-1, 1]) {
+      m.tube([sx * (hw - 0.30), y, z], [sx * (hw + 0.12), y - 3.6, z + (r() - 0.5) * 0.1], 0.085, 0.095, 6, MAT_POST);
+    }
+    // 冠木
+    m.tube([-hw - 0.05, y, z], [hw + 0.05, y, z], 0.075, 0.075, 5, MAT_POST);
+  }
+  // 欄干: 柱と横木 2 本
+  const posts = Math.max(3, Math.round(span / 2.2));
+  for (const sx of [-1, 1]) {
+    const tops: V3[] = [];
+    for (let i = 0; i <= posts; i++) {
+      const t = i / posts;
+      const z = t * span;
+      const base = deckY(t) + 0.05;
+      const lean = (r() - 0.5) * 0.03;
+      m.tube([sx * hw, base, z], [sx * hw + lean, base + 0.86, z], 0.048, 0.040, 5, MAT_POST);
+      tops.push([sx * hw + lean, base + 0.80, z]);
+    }
+    for (let i = 0; i + 1 < tops.length; i++) {
+      m.tube(tops[i], tops[i + 1], 0.036, 0.036, 4, MAT_POST);
+      const lo: V3 = [tops[i][0], tops[i][1] - 0.36, tops[i][2]];
+      const lo2: V3 = [tops[i + 1][0], tops[i + 1][1] - 0.36, tops[i + 1][2]];
+      m.tube(lo, lo2, 0.028, 0.028, 4, MAT_POST);
+    }
+  }
+  // 両端の土台石
+  for (const t of [0.02, 0.98]) {
+    rock(m, [0, deckY(t) - 0.30, t * span], [width + 0.5, 0.5, 0.9], seed + 7 + Math.round(t * 10), MAT_STONE, 0.22);
+  }
+  return m.toFloat32Array();
+}
+
+/**
+ * 山中の石祠。苔むした石段を数段上がり、台石の上に小さな石の社が載るだけの素朴なもの。
+ * 神社の社殿と作りを変える（木でなく石、鳥居も注連縄も無く、屋根は一枚岩）。
+ */
+export function buildStoneShrine(seed: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  // 苔むした石段（3 段）。踏面ごとに幅と厚みをばらす
+  const steps = 3;
+  for (let i = 0; i < steps; i++) {
+    const y = i * 0.17;
+    const z = -0.95 + i * 0.34;
+    const w = 1.5 - i * 0.12 + 0.1 * r();
+    rock(m, [(r() - 0.5) * 0.05, y + 0.085, z], [w, 0.19, 0.36], seed + 10 + i, MAT_MOSSY, 0.20);
+  }
+  const base = steps * 0.17;
+  // 台石（2 段）
+  rock(m, [0, base + 0.14, 0.15], [1.05, 0.28, 0.85], seed + 21, MAT_MOSSY, 0.18);
+  rock(m, [0, base + 0.36, 0.15], [0.78, 0.20, 0.62], seed + 22, MAT_STONE, 0.16);
+  // 社の身舎（石の箱）
+  const bodyY = base + 0.46;
+  m.box([0, bodyY + 0.24, 0.15], [0.52, 0.48, 0.42], MAT_STONE);
+  // 扉のくぼみ（正面）
+  m.box([0, bodyY + 0.22, 0.15 - 0.215], [0.26, 0.34, 0.02], MAT_MOSSY);
+  // 一枚岩の切妻屋根
+  const ry = bodyY + 0.48;
+  for (const sz of [-1, 1]) {
+    m.quad(
+      [-0.40, ry + 0.30, 0.15], [0.40, ry + 0.30, 0.15],
+      [0.40, ry - 0.02, 0.15 + sz * 0.40], [-0.40, ry - 0.02, 0.15 + sz * 0.40], MAT_STONE,
+    );
+  }
+  m.box([0, ry + 0.31, 0.15], [0.82, 0.07, 0.10], MAT_STONE);
+  // 供え物の小さな石と、脇の苔石
+  rock(m, [0.30, base + 0.30, -0.30], [0.20, 0.10, 0.18], seed + 31, MAT_MOSSY, 0.30);
+  rock(m, [-0.34, base + 0.28, -0.26], [0.17, 0.09, 0.16], seed + 32, MAT_MOSSY, 0.30);
+  rock(m, [-1.05, 0.18, 0.30], [0.85, 0.46, 0.70], seed + 33, MAT_MOSSY, 0.34);
+  rock(m, [1.02, 0.14, 0.05], [0.62, 0.36, 0.55], seed + 34, MAT_MOSSY, 0.34);
+  return m.toFloat32Array();
+}
+
+/**
+ * 道祖神。辻に立つ丸みのある石。二体並べ、片方をわずかに傾ける。
+ * 旅の目印なので、道の側に小さな供え石を添える。
+ */
+export function buildWayStone(seed: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const mk = (x: number, h: number, lean: number, sd: number): void => {
+    // 台石
+    rock(m, [x, 0.09, 0], [0.62, 0.20, 0.50], sd, MAT_STONE, 0.26);
+    // 本体: 上が丸い扁平な石。角柱を段に積んで丸みを出す
+    // 段が粗いと箱の積み重ねに見える。段数を増やし、上ほど細く丸める
+    const rings = 9;
+    for (let i = 0; i < rings; i++) {
+      const t = (i + 0.5) / rings;
+      const w = 0.44 * Math.sqrt(Math.max(0.05, 1.0 - t * t * 0.86));
+      const y = 0.18 + h * t;
+      rock(m, [x + lean * t, y, lean * t * 0.4], [w, h / rings + 0.05, w * 0.46], sd + 5 + i, MAT_STONE, 0.10);
+    }
+    // 浅い彫りくぼみ（顔でなく、面をひとつ落とすだけ）
+    m.box([x + lean * 0.55, 0.18 + h * 0.55, -0.115 + lean * 0.2], [0.24, h * 0.42, 0.02], MAT_MOSSY);
+  };
+  mk(-0.26, 0.78, 0.03, seed);
+  mk(0.30, 0.66, -0.05, seed + 40);
+  // 供え石
+  rock(m, [0.02, 0.06, -0.42], [0.34, 0.12, 0.26], seed + 80, MAT_MOSSY, 0.28);
+  if (r() > 0.5) rock(m, [-0.62, 0.07, -0.28], [0.22, 0.13, 0.20], seed + 81, MAT_MOSSY, 0.3);
   return m.toFloat32Array();
 }
