@@ -61,7 +61,9 @@ fn fs(in: VSOut) -> FSOut {
 
   // 材質・法線・日向/日陰はすべて焼いたもの（画素ごとに数式を評価しない）
   let baked = bakedLight(p);
-  var n = select(baked.normal, sampleNormal(p, pixelSize), dbg == 7.0);   // 計測用 dbg=7: 双三次で直接計算
+  // select は両辺を評価する。dbg は一様な値なので分岐にして、計測用の重い経路を実際に飛ばす
+  var n = baked.normal;
+  if (dbg == 7.0) { n = sampleNormal(p, pixelSize); }   // 計測用 dbg=7: 双三次で直接計算
   // 変形の沈みで法線も傾ける（高さだけ変えると、へこんでいるのに陰影が平らなまま）
   let sg = deformSinkGradient(p);
   n = normalize(vec3f(n.x + sg.x * n.y, n.y, n.z + sg.y * n.y));
@@ -81,7 +83,8 @@ fn fs(in: VSOut) -> FSOut {
 
   // 太陽光: 高度ごとの透過後の色（1D LUT）× 地形の影
   let sunLight = sunLightAt(in.world.y);
-  let shadow = select(baked.shadow, terrainShadow(in.world, sun), dbg == 8.0);   // 計測用 dbg=8: 影を行進で直接計算
+  var shadow = baked.shadow;
+  if (dbg == 8.0) { shadow = terrainShadow(in.world, sun); }   // 計測用 dbg=8: 影を行進で直接計算
   // 遮蔽による陰り: 畦・道の際は両側に壁があり、草に覆われた地面は葉に遮られて空が見えにくい
   var ao = 0.60 + 0.40 * smootherstep(0.0, 1.1, baked.ridgeDist);
   if (baked.kind == 0u || baked.kind == 2u || baked.kind == 5u) { ao *= 0.78; }

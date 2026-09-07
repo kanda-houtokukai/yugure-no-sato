@@ -219,6 +219,10 @@ export class WorldScene implements SceneRenderer {
   private buildingDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
   private buildingStats = { total: 0, kinds: [] as { name: string; vertices: number; instances: number }[] };
   private stairInfo = { rise: 0, run: 0, steps: 0, slopeDeg: 0 };
+  /** 道の断面の検証: 敷地の外・縁・中で「道の高さ − 周囲の地面の高さ」 */
+  private pathProfile: { where: string; v: number; road: number; side: number; rise: number }[] = [];
+  /** 敷地の縁が崖になっていないかの横断測線 */
+  private yardEdge: { where: string; drop: number; maxSlopeDeg: number; over: number }[] = [];
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -327,6 +331,7 @@ export class WorldScene implements SceneRenderer {
     await this.buildTrees();
     // --- 建物（同じく数値から。敷地・境内に建てる） ---
     await this.buildBuildings();
+    await this.measurePathProfile();
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -1280,6 +1285,76 @@ export class WorldScene implements SceneRenderer {
     });
   }
 
+  /**
+   * 道の断面を数値で確かめる（田の間は土手、集落の中は地面と同面）。
+   * 道の中心と、そこから 4.5m 離れた点の高さの差を、敷地の外・縁・中で測る。
+   */
+  private async measurePathProfile(): Promise<void> {
+    const spots: { where: string; v: number }[] = [
+      { where: '敷地の外（田の間）', v: -178 },
+      { where: '敷地の縁', v: -157 },
+      { where: '敷地の中（南）', v: -140 },
+      { where: '敷地の中（中央）', v: -128 },
+      { where: '敷地の外（北の田）', v: -95 },
+    ];
+    const rz = new Float32Array(await this.runQuery('riverQuery', [
+      { binding: 6, data: new Float32Array(spots.map(() => 0)), type: 'read-only-storage' },
+    ], { binding: 7, byteLength: spots.length * 4 }, Math.ceil(spots.length / 64)));
+    // 道は縦線 0 に沿うので、その u を問い合わせてから世界座標にする
+    const snapQ = new Float32Array(spots.length * 4);
+    const snapOff = new Float32Array(spots.length);
+    spots.forEach((sp, i) => snapQ.set([0, 0, 0, sp.v + rz[i]], i * 4));
+    const snapped = new Float32Array(await this.runQuery('snapQuery', [
+      { binding: 4, data: snapQ, type: 'read-only-storage' },
+      { binding: 8, data: snapOff, type: 'read-only-storage' },
+    ], { binding: 5, byteLength: spots.length * 8 }, Math.ceil(spots.length / 64)));
+    const pts: [number, number][] = [];
+    spots.forEach((_, i) => {
+      pts.push([snapped[i * 2], snapped[i * 2 + 1]]);          // 道の中心
+      pts.push([snapped[i * 2] + 4.5, snapped[i * 2 + 1]]);    // 4.5m 横
+    });
+    const hs = await this.queryHeights(this.queryModule, pts);
+    // 敷地の縁の横断測線（崖になっていないか）。1m 刻みで地面の高さを取り、最大勾配を出す
+    const transects: { where: string; from: [number, number]; to: [number, number] }[] = [
+      { where: '南の縁（田→敷地・u=30）', from: [30, -176], to: [30, -146] },
+      { where: '東の縁（田→敷地・v=-132）', from: [50, -132], to: [80, -132] },
+    ];
+    const tPts: [number, number][] = [];
+    const N = 31;
+    for (const tr of transects) {
+      const rzs = new Float32Array(await this.runQuery('riverQuery', [
+        { binding: 6, data: new Float32Array([tr.from[0], tr.to[0]]), type: 'read-only-storage' },
+      ], { binding: 7, byteLength: 8 }, 1));
+      for (let i = 0; i < N; i++) {
+        const k = i / (N - 1);
+        const u = tr.from[0] + (tr.to[0] - tr.from[0]) * k;
+        const v = tr.from[1] + (tr.to[1] - tr.from[1]) * k;
+        tPts.push([u, v + rzs[0] + (rzs[1] - rzs[0]) * k]);
+      }
+    }
+    const th = await this.queryHeights(this.queryModule, tPts);
+    this.yardEdge = transects.map((tr, ti) => {
+      const seg = Array.from(th.slice(ti * N, (ti + 1) * N));
+      const step = Math.hypot(tr.to[0] - tr.from[0], tr.to[1] - tr.from[1]) / (N - 1);
+      let maxD = 0;
+      for (let i = 1; i < seg.length; i++) maxD = Math.max(maxD, Math.abs(seg[i] - seg[i - 1]));
+      return {
+        where: tr.where,
+        drop: Number((Math.max(...seg) - Math.min(...seg)).toFixed(3)),
+        maxSlopeDeg: Number(((Math.atan(maxD / step) * 180) / Math.PI).toFixed(1)),
+        over: Number(step.toFixed(2)),
+      };
+    });
+
+    this.pathProfile = spots.map((sp, i) => ({
+      where: sp.where,
+      v: sp.v,
+      road: Number(hs[i * 2].toFixed(3)),
+      side: Number(hs[i * 2 + 1].toFixed(3)),
+      rise: Number((hs[i * 2] - hs[i * 2 + 1]).toFixed(3)),
+    }));
+  }
+
   /** 建物: テンプレートを数値から起こし、敷地の高さを正本に問い合わせて据える */
   private async buildBuildings(): Promise<void> {
     const device = this.device;
@@ -1313,6 +1388,16 @@ export class WorldScene implements SceneRenderer {
       { kind: 'wall10', u: 8.5, v: -152, rot: deg(90), scale: 1.0 },
       { kind: 'wall10', u: -34, v: -128, rot: deg(20), scale: 1.0 },
       { kind: 'wall14', u: 30, v: -112, rot: deg(8), scale: 1.0 },
+      // 集落と田の境。段差 0.85m だけでは読めないので、縁の内側 4〜6m に石垣を並べる。
+      // 途切れさせ、向きをわずかにばらして「造成した擁壁」に見せない
+      { kind: 'wall10', u: -18, v: -152.5, rot: deg(-3), scale: 1.0 },
+      { kind: 'wall10', u: -29, v: -153.5, rot: deg(4), scale: 1.0 },
+      { kind: 'wall10', u: -44, v: -152.0, rot: deg(-5), scale: 1.0 },
+      { kind: 'wall10', u: 18, v: -153.0, rot: deg(3), scale: 1.0 },
+      { kind: 'wall10', u: 33, v: -152.0, rot: deg(-4), scale: 1.0 },
+      { kind: 'wall10', u: 60, v: -126, rot: deg(93), scale: 1.0 },
+      { kind: 'wall10', u: 60.5, v: -139, rot: deg(88), scale: 1.0 },
+      { kind: 'wall10', u: -60, v: -134, rot: deg(91), scale: 1.0 },
     ];
     // 石段の勾配は地形から決める（決め打ちだと埋まるか浮く）。下端と上端の高さを正本に問い合わせる
     const stairV0 = 240;
@@ -1783,6 +1868,8 @@ export class WorldScene implements SceneRenderer {
       trees: this.treeStats,
       buildings: this.buildingStats,
       stairs: this.stairInfo,
+      pathProfile: this.pathProfile,
+      yardEdge: this.yardEdge,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },

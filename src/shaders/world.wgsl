@@ -75,7 +75,7 @@ fn shrineHill(uv: vec2f) -> f32 {
 
 const YARD_C: vec2f = vec2f(0.0, -132.0);       // 集落の敷地の中心（谷座標）
 const YARD_H: vec2f = vec2f(66.0, 26.0);        // 半幅
-const YARD_FEATHER: f32 = 13.0;                 // 縁の傾斜の幅 [m]。狭いと切り土が崖になる
+const YARD_FEATHER: f32 = 7.5;                  // 縁の傾斜の幅 [m]。広すぎると田との段差（0.85m）が読めない
 const PRECINCT_C: vec2f = vec2f(0.0, 270.0);    // 神社の境内
 const PRECINCT_H: vec2f = vec2f(34.0, 24.0);
 const PRECINCT_FEATHER: f32 = 8.0;              // 石段が上がる斜面の幅
@@ -319,11 +319,20 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   if (t < 1.3 || onApproach) {
     let path = nearestPath(uv, pathBase);
     let hw = path.halfWidth * widen;
-    let pathH = h + (path.top - h) * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
-    if (path.dist < hw + 0.7 * widen && pathH > h) {
-      h = pathH;
-      // 道の上は土、土手の斜面（道の縁から 0.7m）は草。田の泥が道の際まで来ないようにする
-      if (path.on) { s.kind = KIND_PATH; s.wet = 0.0; } else { s.kind = KIND_RIDGE; s.wet = 0.0; }
+    // 道の断面は場所で変える。田の間は土手（周囲より高い）、集落の敷地と境内の中は地面と同面。
+    // 土手のまま集落を貫くと道が堤防になり、家がその下に沈んで見える（実機の指摘）。
+    // site.w は敷地の縁で滑らかに 0→1 になるので、移行も自動的に滑らか
+    let riseScale = 1.0 - site.w * 0.94;
+    let rise = (path.top - h) * riseScale;
+    let pathH = h + rise * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
+    if (path.dist < hw + 0.7 * widen) {
+      h = max(h, pathH);
+      // 道の上は土。土手の斜面（道の縁から 0.7m）は草だが、同面になる敷地の中では作らない
+      if (path.on) {
+        s.kind = KIND_PATH; s.wet = 0.0;
+      } else if (site.w < 0.45) {
+        s.kind = KIND_RIDGE; s.wet = 0.0;
+      }
     }
     s.ridgeDist = min(s.ridgeDist, path.dist);
   }
@@ -371,7 +380,7 @@ fn terrainAlbedo(p: vec2f, s: Surface) -> vec3f {
     case 4u: { return mix(vec3f(0.22, 0.20, 0.16), vec3f(0.32, 0.29, 0.24), n); }        // 川床
     case 5u: { return mix(vec3f(0.12, 0.20, 0.08), vec3f(0.22, 0.30, 0.11), n); }        // 丘（草と林）
     case 6u: { return mix(vec3f(0.09, 0.14, 0.09), vec3f(0.16, 0.20, 0.13), n); }        // 山（林）
-    case 7u: { return mix(vec3f(0.26, 0.21, 0.15), vec3f(0.37, 0.30, 0.21), n); }        // 集落の敷地（踏み固めた土）
+    case 7u: { return mix(vec3f(0.33, 0.28, 0.21), vec3f(0.46, 0.40, 0.30), n); }        // 集落の敷地（乾いた踏み固めの土。田の泥と分ける）
     case 8u: { return mix(vec3f(0.33, 0.31, 0.27), vec3f(0.45, 0.42, 0.37), n); }        // 境内（玉砂利まじり）
     case 9u: { return mix(vec3f(0.22, 0.215, 0.20), vec3f(0.34, 0.33, 0.31), n); }       // 石段
     default: { return mix(vec3f(0.20, 0.30, 0.09), vec3f(0.32, 0.38, 0.14), n); }        // 草地
