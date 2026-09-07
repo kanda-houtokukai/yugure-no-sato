@@ -46,7 +46,11 @@ export interface View {
  * 川が西へ抜ける切れ目を低くし、そこへ夕日を沈める（world.wgsl の outlet）。
  */
 const SUN_AZ = 275;
-const SUN_EL = 3.5;
+// 3.5° は夕暮れとして正しいが、散策するには暗すぎた（実機の指摘）。
+// 3.5 / 5 / 6.5 / 8 で撮り比べ、5° を採った。
+// 6.5° 以上は空の暖色が抜けて昼下がりに見え、夕暮れでなくなる。
+// 5° は平均輝度 0.356 → 0.442、暗部の潰れ 0%・明部の飛び 0% を保つ
+const SUN_EL = 5;
 
 const base = { time: 0, sunAzimuthDeg: SUN_AZ, sunElevationDeg: SUN_EL, exposure: 0.45, debug: 0 };
 
