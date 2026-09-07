@@ -252,6 +252,7 @@ export class WorldScene implements SceneRenderer {
   /** 据えた建物・小物の実座標（寄りの絵を撮るときの当たり先） */
   private placements: { kind: string; u: number; v: number; x: number; z: number; y: number }[] = [];
   private passProfile: { u: number; v: number; h: number }[] = [];
+  private roadSteps: { name: string; samples: number; maxStep: number; at: number; maxKink: number; kinkAt: number }[] = [];
   /** 世界座標に展開した当たり判定と歩ける面。テンプレートの局所の箱を据え付けで変換したもの */
   private solids: { x: number; z: number; c: number; s: number; hx: number; hz: number; y0: number; y1: number; r: number }[] = [];
   private decks: { x: number; z: number; c: number; s: number; hx: number; hz: number; y: number; r: number }[] = [];
@@ -402,6 +403,7 @@ export class WorldScene implements SceneRenderer {
     // --- 建物（同じく数値から。敷地・境内に建てる） ---
     await this.buildBuildings();
     await this.measurePathProfile();
+    await this.measureRoadSteps();
     this.figureMesh = device.createBuffer({
       size: WorldScene.FIGURE_MAX_VERTS * VERTEX_FLOATS * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -1417,6 +1419,69 @@ export class WorldScene implements SceneRenderer {
   }
 
   /**
+   * 道の中心線に沿って地面の高さを細かく取り、隣り合う点の差の最大を出す。
+   * 畦道と道が重なるところで段差が残っていれば、ここに歩幅では説明できない値が出る。
+   */
+  private async measureRoadSteps(): Promise<void> {
+    const step = 0.5;
+    type Road = { name: string; family: 0 | 1; index: number; from: number; to: number };
+    const roads: Road[] = [
+      // 石段（v=240〜255）と橋の区間（v=-9〜9、床の上を歩く）は測る範囲から外す
+      { name: '主道 南（縦線 0）', family: 0, index: 0, from: -160, to: -10 },
+      { name: '主道 中（縦線 0）', family: 0, index: 0, from: 10, to: 238 },
+      { name: '主道 北（縦線 0）', family: 0, index: 0, from: 257, to: 285 },
+      { name: '北の環（横線 4）', family: 1, index: 4, from: -468, to: 130 },
+      { name: '南の環（横線 -3）', family: 1, index: -3, from: -102, to: 3 },
+      { name: '川沿いの道（横線 1）', family: 1, index: 1, from: -468, to: 130 },
+      { name: '縦線 -4', family: 0, index: -4, from: -111, to: -56 },
+      { name: '縦線 5', family: 0, index: 5, from: 7, to: 59 },
+    ];
+    const out: { name: string; samples: number; maxStep: number; at: number; maxKink: number; kinkAt: number }[] = [];
+    for (const rd of roads) {
+      const n = Math.floor((rd.to - rd.from) / step) + 1;
+      const q = new Float32Array(n * 4);
+      const off = new Float32Array(n);
+      // 縦線は v を、横線は x を振る。z は谷座標 v に川の蛇行を足したもの
+      const axis: number[] = [];
+      for (let i = 0; i < n; i++) axis.push(rd.from + i * step);
+      if (rd.family === 0) {
+        // 川の蛇行はその縦線のあたりの x で引く。x=0 で引くと v の対応が数十 m ずれる
+        const approxX = rd.index * 26;
+        const rz = new Float32Array(await this.runQuery('riverQuery', [
+          { binding: 6, data: new Float32Array(axis.map(() => approxX)), type: 'read-only-storage' },
+        ], { binding: 7, byteLength: n * 4 }, Math.ceil(n / 64)));
+        axis.forEach((v, i) => q.set([0, rd.index, 0, v + rz[i]], i * 4));
+      } else {
+        axis.forEach((x, i) => q.set([1, rd.index, x, 0], i * 4));
+      }
+      const snapped = new Float32Array(await this.runQuery('snapQuery', [
+        { binding: 4, data: q, type: 'read-only-storage' },
+        { binding: 8, data: off, type: 'read-only-storage' },
+      ], { binding: 5, byteLength: n * 8 }, Math.ceil(n / 64)));
+      const pts: [number, number][] = [];
+      for (let i = 0; i < n; i++) pts.push([snapped[i * 2], snapped[i * 2 + 1]]);
+      const hs = await this.queryHeights(this.queryModule, pts);
+      // 一次差は勾配。急斜面では 0.5m 刻みで 0.5m 上がるのが正常なので、段差の検出には使えない。
+      // 二次差（勾配の変化＝折れ）を見る。連続な斜面なら 0 に近く、段差があれば跳ねる
+      let worst = 0, at = 0, kink = 0, kinkAt = 0;
+      for (let i = 1; i < hs.length; i++) {
+        const d = Math.abs(hs[i] - hs[i - 1]);
+        if (d > worst) { worst = d; at = axis[i]; }
+        if (i >= 2) {
+          const k = Math.abs(hs[i] - 2 * hs[i - 1] + hs[i - 2]);
+          if (k > kink) { kink = k; kinkAt = axis[i]; }
+        }
+      }
+      out.push({
+        name: rd.name, samples: n,
+        maxStep: Number(worst.toFixed(4)), at: Number(at.toFixed(1)),
+        maxKink: Number(kink.toFixed(4)), kinkAt: Number(kinkAt.toFixed(1)),
+      });
+    }
+    this.roadSteps = out;
+  }
+
+  /**
    * 道の断面を数値で確かめる（田の間は土手、集落の中は地面と同面）。
    * 道の中心と、そこから 4.5m 離れた点の高さの差を、敷地の外・縁・中で測る。
    */
@@ -1434,8 +1499,8 @@ export class WorldScene implements SceneRenderer {
     for (const u of [0, 100, 210, 320, 430]) passPts.push([u, 395]);
     // 川を渡るところ（橋の設計用）: u=0 の主道上で v を振る
     for (const v of [-12, -9, -7, -6.5, -5, -3, 0, 3, 5, 6.5, 7, 9, 12]) passPts.push([0, v]);
-    // 隣の集落の候補地（谷の出口・西）
-    for (const u of [-380, -430, -470, -510]) for (const v of [-70, -40, 30, 60]) passPts.push([u, v]);
+    // 参道 v=224〜240 を 1m 刻みで（u を振る）
+    for (const u of [-6, 0, 6]) for (let v = 224; v <= 240; v += 1) passPts.push([u, v]);
     {
       const rz = new Float32Array(await this.runQuery('riverQuery', [
         { binding: 6, data: new Float32Array(passPts.map((q) => q[0])), type: 'read-only-storage' },
@@ -2397,6 +2462,7 @@ export class WorldScene implements SceneRenderer {
       yardEdge: this.yardEdge,
       placements: this.placements,
       passProfile: this.passProfile,
+      roadSteps: this.roadSteps,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: {

@@ -76,7 +76,10 @@ fn passRidge(uv: vec2f) -> f32 {
   // 鞍部: u = PASS_U のあたりだけ低い
   let sN = (uv.x - PASS_U) / 120.0;
   let notch = 1.0 - 0.62 * exp(-sN * sN * 1.4);
-  return 78.0 * ridge * notch;
+  // 盆地の中には効かせない。裾が田まで伸びると、田の外の地面だけが 1.5m 持ち上がり、
+  // 田の縁に段差の壁ができる（実測で主道に 1.5m の段差として出た）
+  let gate = smootherstep(0.95, 1.35, basinT(uv));
+  return 78.0 * ridge * notch * gate;
 }
 
 /**
@@ -404,6 +407,9 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   let widen = clamp(minWl * 2.5 / 0.8, 1.0, 3.0);
   let bumpScale = 1.0 - smootherstep(3.0, 6.0, minWl);
 
+  // 道の高さの基準にする面。畦の盛り上がりは含めない。
+  // 含めると、道が畦を横切るところで道の天端まで畦の高さぶん跳ね上がり、段差になる（実機の指摘）
+  var hFlat = h;
   if (t < 1.05) {
     let c = resolveCell(uv);
     if (c.isPaddy) {
@@ -434,7 +440,7 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
   // （基準を谷底のままにすると、一段高い敷地に道が埋もれて消える）
   // その場の地面の高さを下回らせない。谷底基準のままだと、丘を上る参道で
   // 道の高さが地面より低くなり、道が一切現れない（実測）
-  let pathBase = max(mix(floorH, site.level, site.w), h);
+  let pathBase = max(mix(floorH, site.level, site.w), hFlat);
   // 参道は盆地の外（t > 1.3）へ出るので、その範囲も通す。
   // 条件を t < 1.3 だけにすると、境内へ上がる斜面が草地のままになる
   let onApproach = abs(uv.x) < 22.0 && uv.y > 140.0 && uv.y < 292.0;
@@ -486,13 +492,16 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
     }
   }
 
-  // 川の掘り込み
+  // 川の掘り込み。帯の縁で急に切り替えると 0.5m の段差になるので、縁の 2.5m でなじませる
   if (abs(uv.y) < RIVER_BAND) {
     let bed = riverBed(uv.y);
     if (bed < h) {
-      h = bed;
-      s.kind = KIND_RIVERBED;
-      s.wet = smootherstep(RIVER_HALF + 0.8, RIVER_HALF - 0.3, abs(uv.y));
+      let w = smootherstep(RIVER_BAND, RIVER_BAND - 2.5, abs(uv.y));
+      h = mix(h, bed, w);
+      if (w > 0.5) {
+        s.kind = KIND_RIVERBED;
+        s.wet = smootherstep(RIVER_HALF + 0.8, RIVER_HALF - 0.3, abs(uv.y));
+      }
     }
   }
 

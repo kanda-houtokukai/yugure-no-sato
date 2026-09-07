@@ -523,10 +523,11 @@ export function buildShrine(seed: number, scale: number): Built {
       m.tube(base, tip, 0.075 * scale, 0.055 * scale, 4, MAT_POST);
     }
   }
-  // 正面の階段
+  // 正面（+Z 側。扉と同じ側）の階段。
+  // 建物に近い段ほど「高い」。逆にすると床へ上がるのに下る形になる（実機の指摘）
   const steps = 5;
   for (let i = 0; i < steps; i++) {
-    const y = (fl * (i + 1)) / steps;
+    const y = (fl * (steps - i)) / steps;   // i=0（建物際）が床の高さ、i=4（手前）が最下段
     const z = hd + 0.45 + i * 0.30;
     m.box([0, y - fl / steps / 2, z], [W * 0.55, fl / steps, 0.34], MAT_POST);
   }
