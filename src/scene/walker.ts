@@ -74,7 +74,11 @@ export class Walker {
    * 1 フレーム進める。groundHeight で足元の高さに追従。
    * 足跡はここでは打たない。人物（figure.ts）の足が実際に着いた瞬間に打つ（フェーズ6 段階3）。
    */
-  step(input: WalkerInput, dt: number, groundHeight: (x: number, z: number) => number): void {
+  step(
+    input: WalkerInput, dt: number,
+    groundHeight: (x: number, z: number) => number,
+    resolveCollision?: (x: number, z: number, footY: number) => [number, number],
+  ): void {
     this.yawDeg += input.yawDelta;
     this.pitchDeg = Math.max(-8, Math.min(60, this.pitchDeg + input.pitchDelta));
     const yaw = (this.yawDeg * Math.PI) / 180;
@@ -91,6 +95,11 @@ export class Walker {
       const dist = speed * dt;
       this.x += mx * dist;
       this.z += mz * dist;
+      // 建物・石垣・柱にめり込まないよう押し戻す。押し戻された分は「進めなかった分」
+      if (resolveCollision) {
+        const [rx2, rz2] = resolveCollision(this.x, this.z, this.y);
+        this.x = rx2; this.z = rz2;
+      }
       this.lastDirX = mx; this.lastDirZ = mz;
       this.lastMoved = dist;
       this.routeDistance += dist;

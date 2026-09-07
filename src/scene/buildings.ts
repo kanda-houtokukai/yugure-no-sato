@@ -14,7 +14,7 @@ export const MAT_STONE = 7;
 export const MAT_THATCH = 8;        // 茅葺き
 export const MAT_GRASS_RIDGE = 9;   // 芝棟（棟に生える草）
 
-import { MeshBuilder, rng, type V3 } from './mesh';
+import { MeshBuilder, rng, type Built, type V3 } from './mesh';
 
 export interface FarmhouseParams {
   /** 間口 [m]（棟が走る向き = X） */
@@ -56,10 +56,6 @@ export const FARMHOUSE_DEFAULT: FarmhouseParams = {
   style: 'house',
   roof: 'tile',
 };
-
-function finish(m: MeshBuilder): Float32Array {
-  return m.toFloat32Array();
-}
 
 /**
  * 茅葺きの屋根。瓦と作りが別物なので分けた。
@@ -154,7 +150,7 @@ function buildThatchRoof(
  * 農家 1 棟。原点は地面の中心、+Z が正面（縁側のある側）。
  * 棟は X 方向に走る（平入り）。
  */
-export function buildFarmhouse(seed: number, p: FarmhouseParams): Float32Array {
+export function buildFarmhouse(seed: number, p: FarmhouseParams): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const W = p.width, D = p.depth;
@@ -372,7 +368,13 @@ export function buildFarmhouse(seed: number, p: FarmhouseParams): Float32Array {
   // ---- 玄関の踏み石 ----
   m.box([W * 0.18, 0.11, hd + p.veranda + 0.35], [1.1, 0.22, 0.8], MAT_STONE);
   void r;
-  return finish(m);
+
+  // 当たり判定: 壁の外周。軒（eaveOut）は含めないので軒下はくぐれる。
+  // 縁側がある側（+Z）はその分だけ広げる（縁側に上がる高さは作らない＝通り抜けない塊にする）
+  const cd = D + p.veranda;
+  m.solid([0, (eh + 1.0) / 2, p.veranda / 2], [W, eh + 1.0, cd]);
+
+  return m.built();
 }
 
 
@@ -400,7 +402,7 @@ export const STOREHOUSE_DEFAULT: FarmhouseParams = {
  * 明神鳥居。笠木が反り、島木・貫・額束を持つ。柱は上でわずかに内へ倒す（転び）。
  * 原点は地面の中心、参道は Z 方向（+Z が手前）。
  */
-export function buildTorii(seed: number, height: number, span: number): Float32Array {
+export function buildTorii(seed: number, height: number, span: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const pr = height * 0.052;              // 柱の半径
@@ -438,14 +440,18 @@ export function buildTorii(seed: number, height: number, span: number): Float32A
   // 額束（貫と島木の間の短い柱）
   m.box([0, (nukiY + shimaY) / 2, 0], [height * 0.055, shimaY - nukiY, pr * 1.2], MAT_POST);
   void r;
-  return finish(m);
+
+  // 当たり判定: 柱 2 本だけ（間はくぐれる）
+  for (const sx of [-1, 1]) m.solid([sx * span / 2, height / 2, 0], [0.62, height, 0.62]);
+
+  return m.built();
 }
 
 /**
  * 小さな村の社殿。高床・板壁・切妻の妻入・階段と縁・千木と鰹木。
  * 原点は地面の中心、+Z が正面（階段のある側）。
  */
-export function buildShrine(seed: number, scale: number): Float32Array {
+export function buildShrine(seed: number, scale: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const W = 3.6 * scale, D = 3.2 * scale;
@@ -525,11 +531,15 @@ export function buildShrine(seed: number, scale: number): Float32Array {
     m.box([0, y - fl / steps / 2, z], [W * 0.55, fl / steps, 0.34], MAT_POST);
   }
   void r;
-  return finish(m);
+
+  // 当たり判定: 社殿の身舎（階段と縁は含めない）
+  m.solid([0, 1.6 * scale, 0], [4.2 * scale, 3.2 * scale, 3.4 * scale]);
+
+  return m.built();
 }
 
 /** 石灯籠。基礎・竿・中台・火袋・笠・宝珠 */
-export function buildLantern(seed: number, h: number): Float32Array {
+export function buildLantern(seed: number, h: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const s = h / 2.2;
@@ -551,14 +561,18 @@ export function buildLantern(seed: number, h: number): Float32Array {
   m.tube([0, 1.72 * s, 0], [0, 1.98 * s, 0], 0.46 * s, 0.20 * s, 8, MAT_STONE);   // 笠
   m.tube([0, 1.98 * s, 0], [0, 2.20 * s, 0], 0.10 * s, 0.02 * s, 6, MAT_STONE);   // 宝珠
   void r;
-  return finish(m);
+
+  // 当たり判定: 竿から火袋まで
+  m.solid([0, h / 2, 0], [0.52, h, 0.52]);
+
+  return m.built();
 }
 
 /**
  * 石段。境内の縁の斜面を上がる。段の一枚ずつに厚みと不揃いがある。
  * 原点は下端の中心、+Z へ上がる。
  */
-export function buildStairs(seed: number, steps: number, width: number, rise: number, run: number): Float32Array {
+export function buildStairs(seed: number, steps: number, width: number, rise: number, run: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   for (let i = 0; i < steps; i++) {
@@ -574,7 +588,7 @@ export function buildStairs(seed: number, steps: number, width: number, rise: nu
       m.box([sx * (w / 2 + 0.16), y + rise * 0.5 - t * 0.25, z + run / 2], [0.32 + 0.1 * r(), t * 1.5, run * 0.95], MAT_STONE);
     }
   }
-  return finish(m);
+  return m.built();
 }
 
 /**
@@ -582,7 +596,7 @@ export function buildStairs(seed: number, steps: number, width: number, rise: nu
  * 原点は中央下端、X 方向に長さ len、高さ h。規則的な格子に見えないよう
  * 段ごとに石の幅・高さ・出入りを変え、目地に隙間を残す。
  */
-export function buildStoneWall(seed: number, len: number, h: number, depth = 0.55): Float32Array {
+export function buildStoneWall(seed: number, len: number, h: number, depth = 0.55): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   let y = 0;
@@ -609,5 +623,9 @@ export function buildStoneWall(seed: number, len: number, h: number, depth = 0.5
     y += ch;
     course++;
   }
-  return finish(m);
+
+  // 当たり判定: 石垣の全長。メッシュと同じ len / h / depth から出す
+  m.solid([0, h / 2, 0], [len, h, depth]);
+
+  return m.built();
 }

@@ -5,7 +5,7 @@
 //   10 作物の葉  11 竹  12 藁・干し草  13 割った薪の木口  14 耕した土（畝）  15 農具の刃（鉄）  16 薪の樹皮
 
 import { MAT_DECK, MAT_PLANK, MAT_POST, MAT_STONE } from './buildings';
-import { MeshBuilder, rng, type V3 } from './mesh';
+import { MeshBuilder, rng, type Built, type V3 } from './mesh';
 
 export const MAT_LEAF = 10;
 export const MAT_BAMBOO = 11;
@@ -117,7 +117,7 @@ function crop(m: MeshBuilder, x: number, z: number, kindOfCrop: number, r: () =>
  * 菜園。畝を立てて作物を並べ、支柱を立てて紐で結わえる。
  * rows 本の畝が Z 方向に並び、各畝は X 方向に len m 伸びる。
  */
-export function buildVegetablePatch(seed: number, rows: number, len: number): Float32Array {
+export function buildVegetablePatch(seed: number, rows: number, len: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const pitch = 0.75;
@@ -165,14 +165,14 @@ export function buildVegetablePatch(seed: number, rows: number, len: number): Fl
       }
     }
   }
-  return m.toFloat32Array();
+  return m.built();
 }
 
 /**
  * 干し場。竹の脚を交叉させ、横竿を渡して藁束を掛ける。
  * 稲刈り前なので稲架ではなく、日常の物干し・藁干しの体。
  */
-export function buildDryingRack(seed: number, len: number): Float32Array {
+export function buildDryingRack(seed: number, len: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const h = 1.32 + 0.12 * r();
@@ -208,14 +208,14 @@ export function buildDryingRack(seed: number, len: number): Float32Array {
       }
     }
   }
-  return m.toFloat32Array();
+  return m.built();
 }
 
 /**
  * 薪の積み場。割った薪を木口を手前に向けて積む。
  * 端は崩れやすいので、段ごとに本数と高さをばらす。
  */
-export function buildWoodpile(seed: number, wide: number, high: number): Float32Array {
+export function buildWoodpile(seed: number, wide: number, high: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const logR = 0.062;
@@ -243,11 +243,15 @@ export function buildWoodpile(seed: number, wide: number, high: number): Float32
       disc(m, [x, y + jy, -d / 2 + jz], [0, 0, -1], rr, sides, MAT_SPLITWOOD);
     }
   }
-  return m.toFloat32Array();
+
+  // 当たり判定: 積んだ薪の塊（メッシュと同じ wide / high / depth から）
+  m.solid([0, high / 2, 0], [wide, high, depth]);
+
+  return m.built();
 }
 
 /** 井戸。石の井筒に、四本柱と小さな切妻の覆い。釣瓶の桶を下げる */
-export function buildWell(seed: number): Float32Array {
+export function buildWell(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const rad = 0.62;
@@ -294,11 +298,16 @@ export function buildWell(seed: number): Float32Array {
   const br = 0.15, bh = 0.22;
   m.tube([0.02, curb + 0.55, 0.02], [0.02, curb + 0.55 - bh, 0.02], br, br * 0.88, 8, MAT_PLANK);
   disc(m, [0.02, curb + 0.55 - bh, 0.02], [0, -1, 0], br * 0.88, 8, MAT_PLANK);
-  return m.toFloat32Array();
+
+  // 当たり判定: 井筒と、覆いの四本柱
+  m.solid([0, curb / 2, 0], [rad * 2 + 0.3, curb + 0.2, rad * 2 + 0.3]);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) m.solid([sx * 0.64, ph / 2, sz * 0.49], [0.22, ph, 0.22]);
+
+  return m.built();
 }
 
 /** 農具の立てかけ。鍬・熊手・箕を壁に立てかける（壁は別に建っている前提で、根元を少し前に出す） */
-export function buildTools(seed: number): Float32Array {
+export function buildTools(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const mk = (x: number, len: number, head: 'hoe' | 'rake' | 'pole'): void => {
@@ -320,11 +329,11 @@ export function buildTools(seed: number): Float32Array {
   mk(-0.42, 1.42, 'hoe');
   mk(-0.06, 1.55, 'rake');
   mk(0.34, 1.30, 'pole');
-  return m.toFloat32Array();
+  return m.built();
 }
 
 /** 桶と籠。数点まとめて 1 テンプレートにし、散らして置く */
-export function buildVessels(seed: number): Float32Array {
+export function buildVessels(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   // 伏せた桶
@@ -347,25 +356,25 @@ export function buildVessels(seed: number): Float32Array {
     const cx = -0.52, cz = 0.3;
     m.tube([cx, 0.02, cz], [cx - 0.10, 0.42, cz - 0.08], 0.30, 0.28, 10, MAT_BAMBOO);
   }
-  return m.toFloat32Array();
+  return m.built();
 }
 
 /** 大きな石を数個。庭石・踏み石として敷地に散らす */
-export function buildStones(seed: number): Float32Array {
+export function buildStones(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   rock(m, [0, 0.20, 0], [0.85, 0.48, 0.72], seed + 1);
   rock(m, [1.05, 0.11, 0.42], [0.52, 0.26, 0.46], seed + 2);
   rock(m, [-0.72, 0.09, -0.55], [0.44, 0.22, 0.40], seed + 3);
   if (r() > 0.4) rock(m, [0.35, 0.07, -0.95], [0.34, 0.17, 0.33], seed + 4);
-  return m.toFloat32Array();
+  return m.built();
 }
 
 /**
  * 峠の休み処。四本柱に板葺きの切妻をかけ、片側に縁台を置いただけの簡素なもの。
  * 上りきったところに「立ち止まる理由」を作る。
  */
-export function buildShelter(seed: number): Float32Array {
+export function buildShelter(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const W = 2.9, D = 2.3;          // 柱の間隔
@@ -413,14 +422,18 @@ export function buildShelter(seed: number): Float32Array {
     const z = -D / 2 + 0.42 + i * 0.28;
     m.box([0, bh + 0.03, z], [W - 0.3, 0.045, 0.24], MAT_DECK);
   }
-  return m.toFloat32Array();
+
+  // 当たり判定: 四本柱だけ（屋根の下には入れる。縁台には腰かけられる想定で塊にしない）
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) m.solid([sx * W / 2, postH / 2, sz * D / 2], [0.26, postH, 0.26]);
+
+  return m.built();
 }
 
 /**
  * 木の橋。丸太の桁に板を並べ、川の中に 2 基の橋脚を立て、簡素な欄干を付ける。
  * 原点は手前の岸の地面、+Z が対岸の向き。橋脚は川床まで届くよう長めにして埋める。
  */
-export function buildBridge(seed: number, span: number, width: number): Float32Array {
+export function buildBridge(seed: number, span: number, width: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const hw = width / 2;
@@ -477,14 +490,26 @@ export function buildBridge(seed: number, span: number, width: number): Float32A
   for (const t of [0.02, 0.98]) {
     rock(m, [0, deckY(t) - 0.30, t * span], [width + 0.5, 0.5, 0.9], seed + 7 + Math.round(t * 10), MAT_STONE, 0.22);
   }
-  return m.toFloat32Array();
+
+  // 上を歩ける床（欄干の内側）。桁の弧に合わせて区間ごとに高さを変える
+  const deckSeg = 16;
+  for (let i = 0; i < deckSeg; i++) {
+    const t = (i + 0.5) / deckSeg;
+    m.deck([0, deckY(t) + 0.06, t * span], [width - 0.12, 0, span / deckSeg + 0.08]);
+  }
+  // 当たり判定: 欄干（両側）。これで橋の上から川へ落ちない
+  for (const sx of [-1, 1]) {
+    m.solid([sx * hw, deck + arch * 0.5 + 0.5, span / 2], [0.16, 1.4, span]);
+  }
+
+  return m.built();
 }
 
 /**
  * 山中の石祠。苔むした石段を数段上がり、台石の上に小さな石の社が載るだけの素朴なもの。
  * 神社の社殿と作りを変える（木でなく石、鳥居も注連縄も無く、屋根は一枚岩）。
  */
-export function buildStoneShrine(seed: number): Float32Array {
+export function buildStoneShrine(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   // 苔むした石段（3 段）。踏面ごとに幅と厚みをばらす
@@ -518,14 +543,18 @@ export function buildStoneShrine(seed: number): Float32Array {
   rock(m, [-0.34, base + 0.28, -0.26], [0.17, 0.09, 0.16], seed + 32, MAT_MOSSY, 0.30);
   rock(m, [-1.05, 0.18, 0.30], [0.85, 0.46, 0.70], seed + 33, MAT_MOSSY, 0.34);
   rock(m, [1.02, 0.14, 0.05], [0.62, 0.36, 0.55], seed + 34, MAT_MOSSY, 0.34);
-  return m.toFloat32Array();
+
+  // 当たり判定: 台石から社まで（石段は前に張り出すので含めない）
+  m.solid([0, base / 2 + 0.55, 0.15], [1.15, base + 1.1, 0.95]);
+
+  return m.built();
 }
 
 /**
  * 道祖神。辻に立つ丸みのある石。二体並べ、片方をわずかに傾ける。
  * 旅の目印なので、道の側に小さな供え石を添える。
  */
-export function buildWayStone(seed: number): Float32Array {
+export function buildWayStone(seed: number): Built {
   const r = rng(seed);
   const m = new MeshBuilder();
   const mk = (x: number, h: number, lean: number, sd: number): void => {
@@ -548,5 +577,9 @@ export function buildWayStone(seed: number): Float32Array {
   // 供え石
   rock(m, [0.02, 0.06, -0.42], [0.34, 0.12, 0.26], seed + 80, MAT_MOSSY, 0.28);
   if (r() > 0.5) rock(m, [-0.62, 0.07, -0.28], [0.22, 0.13, 0.20], seed + 81, MAT_MOSSY, 0.3);
-  return m.toFloat32Array();
+
+  // 当たり判定: 二体をまとめて 1 つの塊に（間に挟まらないように）
+  m.solid([0.02, 0.5, 0], [1.15, 1.0, 0.6]);
+
+  return m.built();
 }

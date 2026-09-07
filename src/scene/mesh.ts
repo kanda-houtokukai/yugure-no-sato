@@ -28,8 +28,49 @@ export function rng(seed: number): () => number {
   };
 }
 
+/**
+ * 当たり判定の箱（テンプレートの局所座標・軸並行）。
+ * メッシュを組むのと同じ関数の中で、同じ数値から出す。形を二重に定義しない。
+ */
+export interface Collider {
+  cx: number; cz: number;
+  hx: number; hz: number;
+  /** 足元からの高さの範囲 */
+  y0: number; y1: number;
+}
+
+/** 上を歩ける面（橋の床など）。局所座標・軸並行 */
+export interface Platform {
+  cx: number; cz: number;
+  hx: number; hz: number;
+  y: number;
+}
+
+/** テンプレート 1 つの出力: 形・当たり判定・歩ける面 */
+export interface Built {
+  mesh: Float32Array;
+  colliders: Collider[];
+  platforms: Platform[];
+}
+
 export class MeshBuilder {
   data: number[] = [];
+  colliders: Collider[] = [];
+  platforms: Platform[] = [];
+
+  /** 通り抜けられない塊。center と size はメッシュと同じ数値を渡すこと */
+  solid(center: V3, size: V3): void {
+    this.colliders.push({
+      cx: center[0], cz: center[2],
+      hx: size[0] / 2, hz: size[2] / 2,
+      y0: center[1] - size[1] / 2, y1: center[1] + size[1] / 2,
+    });
+  }
+
+  /** 上を歩ける面 */
+  deck(center: V3, size: V3): void {
+    this.platforms.push({ cx: center[0], cz: center[2], hx: size[0] / 2, hz: size[2] / 2, y: center[1] });
+  }
 
   push(p: V3, n: V3, uv: [number, number], kind: number, aux: number): void {
     this.data.push(p[0], p[1], p[2], n[0], n[1], n[2], uv[0], uv[1], kind, aux);
@@ -105,5 +146,10 @@ export class MeshBuilder {
 
   toFloat32Array(): Float32Array {
     return new Float32Array(this.data);
+  }
+
+  /** テンプレートの出力にまとめる */
+  built(): Built {
+    return { mesh: new Float32Array(this.data), colliders: this.colliders, platforms: this.platforms };
   }
 }

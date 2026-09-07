@@ -29,7 +29,7 @@ import detailBakeWgsl from '../shaders/detail-bake.wgsl?raw';
 import detailSampleWgsl from '../shaders/detail-sample.wgsl?raw';
 import buildingWgsl from '../shaders/building.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
-import { VERTEX_FLOATS } from './mesh';
+import { VERTEX_FLOATS, type Built } from './mesh';
 import {
   BARN_DEFAULT, FARMHOUSE_DEFAULT, STOREHOUSE_DEFAULT,
   buildFarmhouse, buildLantern, buildShrine, buildStoneWall, buildTorii,
@@ -252,6 +252,11 @@ export class WorldScene implements SceneRenderer {
   /** 据えた建物・小物の実座標（寄りの絵を撮るときの当たり先） */
   private placements: { kind: string; u: number; v: number; x: number; z: number; y: number }[] = [];
   private passProfile: { u: number; v: number; h: number }[] = [];
+  /** 世界座標に展開した当たり判定と歩ける面。テンプレートの局所の箱を据え付けで変換したもの */
+  private solids: { x: number; z: number; c: number; s: number; hx: number; hz: number; y0: number; y1: number; r: number }[] = [];
+  private decks: { x: number; z: number; c: number; s: number; hx: number; hz: number; y: number; r: number }[] = [];
+  /** 当たり判定の計測 */
+  collideStats = { solids: 0, decks: 0, tests: 0, pushes: 0, maxPush: 0, msMax: 0, insideFrames: 0, onDeckFrames: 0, frames: 0 };
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -1399,6 +1404,15 @@ export class WorldScene implements SceneRenderer {
       const vertexCount = variant.vertices.length / TREE_VERTEX_FLOATS;
       this.treeDraws.push({ mesh, vertexCount, instances, instanceCount: mine.length, name: variant.name });
       this.treeStats.variants.push({ name: variant.name, vertices: vertexCount, instances: mine.length });
+      // 幹は通り抜けられない。木は指示に無いが、抜けられると世界が壊れる
+      mine.forEach((i) => {
+        const t = plan[i];
+        const rad = 0.34 * t.scale;
+        this.solids.push({
+          x: xz[i][0], z: xz[i][1], c: 1, s: 0, hx: rad, hz: rad,
+          y0: heights[i] - 1, y1: heights[i] + 6 * t.scale, r: rad * 1.5,
+        });
+      });
     });
   }
 
@@ -1622,7 +1636,7 @@ export class WorldScene implements SceneRenderer {
       roof: 'thatch', thatchThickness: 0.55,
     };
     // テンプレートは種類ごとに 1 つだけ作り、値を変えて使い回す
-    const templates: Record<string, Float32Array> = {
+    const templates: Record<string, Built> = {
       thatch: buildFarmhouse(202, thatchParams),
       house: buildFarmhouse(101, FARMHOUSE_DEFAULT),
       barn: buildFarmhouse(303, BARN_DEFAULT),
@@ -1648,7 +1662,8 @@ export class WorldScene implements SceneRenderer {
     };
     this.buildingDraws = [];
     const kindsStat: { name: string; vertices: number; instances: number }[] = [];
-    for (const [name, mesh] of Object.entries(templates)) {
+    for (const [name, tpl] of Object.entries(templates)) {
+      const mesh = tpl.mesh;
       const mine = plan.map((b, i) => (b.kind === name ? i : -1)).filter((i) => i >= 0);
       if (mine.length === 0) continue;
       const inst = new Float32Array(mine.length * 8);
@@ -1664,6 +1679,35 @@ export class WorldScene implements SceneRenderer {
       kindsStat.push({ name, vertices: vertexCount, instances: mine.length });
     }
     this.buildingStats = { total: plan.length, kinds: kindsStat };
+    // 当たり判定と歩ける面を世界座標へ展開する。
+    // 箱はテンプレートを組んだのと同じ関数・同じ数値から出ているので、形が食い違うことはない
+    plan.forEach((b, i) => {
+      const tpl = templates[b.kind];
+      if (!tpl) return;
+      const c = Math.cos(b.rot), sn = Math.sin(b.rot);
+      const k = b.scale;
+      const [px, pz] = xz[i];
+      const py = heights[i] + (b.lift ?? 0);
+      for (const col of tpl.colliders) {
+        const lx = col.cx * k, lz = col.cz * k;
+        this.solids.push({
+          x: px + lx * c - lz * sn, z: pz + lx * sn + lz * c, c, s: sn,
+          hx: col.hx * k, hz: col.hz * k,
+          y0: py + col.y0 * k, y1: py + col.y1 * k,
+          r: Math.hypot(col.hx, col.hz) * k + 0.6,
+        });
+      }
+      for (const pf of tpl.platforms) {
+        const lx = pf.cx * k, lz = pf.cz * k;
+        this.decks.push({
+          x: px + lx * c - lz * sn, z: pz + lx * sn + lz * c, c, s: sn,
+          hx: pf.hx * k, hz: pf.hz * k, y: py + pf.y * k,
+          r: Math.hypot(pf.hx, pf.hz) * k + 0.6,
+        });
+      }
+    });
+    this.collideStats.solids = this.solids.length;
+    this.collideStats.decks = this.decks.length;
     // 寄りの絵を撮るとき、谷座標 (u,v) から世界座標へ自分で換算すると必ずずれる。据えた実座標を出す
     this.placements = plan.map((b, i) => ({
       kind: b.kind, u: b.u, v: b.v,
@@ -1778,9 +1822,80 @@ export class WorldScene implements SceneRenderer {
   /** 足元の高さ（近景段の CPU 複製を双線形で読む）。段の外なら視点の地面高さで代用 */
   groundHeight = (x: number, z: number): number => {
     const l = this.l0;
-    if (!l) return this.resolved.eyeGroundHeight;
-    return sampleL0(l, x, z) ?? this.resolved.eyeGroundHeight;
+    const ground = l ? (sampleL0(l, x, z) ?? this.resolved.eyeGroundHeight) : this.resolved.eyeGroundHeight;
+    // 橋の床は川床より上にある。床の上に居るときはそちらを地面とする
+    const deck = this.decks.length > 0 ? this.deckHeight(x, z) : null;
+    return deck !== null && deck > ground ? deck : ground;
   };
+
+  /**
+   * 上を歩ける面（橋の床）の高さ。無ければ null。
+   * 川床より上にある床を返すので、橋の上を歩いているときは川に落ちない。
+   */
+  private deckHeight(x: number, z: number): number | null {
+    let best: number | null = null;
+    for (const d of this.decks) {
+      const dx = x - d.x, dz = z - d.z;
+      if (dx * dx + dz * dz > d.r * d.r) { continue; }
+      // 面の局所座標へ
+      const lx = dx * d.c + dz * d.s;
+      const lz = -dx * d.s + dz * d.c;
+      if (Math.abs(lx) > d.hx || Math.abs(lz) > d.hz) { continue; }
+      if (best === null || d.y > best) { best = d.y; }
+    }
+    return best;
+  }
+
+  /**
+   * 建物・石垣・柱にめり込まないよう、歩き手を押し戻す。
+   * 円（半径 r）と、向きを持つ箱の当たり判定。押し戻しは「めり込みの浅い軸」へ出すので、
+   * 壁に沿って歩ける（角でも 2 軸に順に押し出されるだけで挟まらない）。
+   */
+  resolveCollision = (x: number, z: number, footY: number, r = 0.34): [number, number] => {
+    const t0 = performance.now();
+    let px = x, pz = z;
+    // 角では 1 回の押し戻しで別の箱に入り直すことがあるので数回まわす
+    for (let iter = 0; iter < 3; iter++) {
+      let moved = false;
+      for (const b of this.solids) {
+        const dx = px - b.x, dz = pz - b.z;
+        const rr = b.r + r;
+        if (dx * dx + dz * dz > rr * rr) { continue; }
+        // 足元がその箱の高さの範囲に無ければ当たらない（軒下・橋の下をくぐれる）
+        if (footY > b.y1 - 0.10 || footY + 1.55 < b.y0) { continue; }
+        this.collideStats.tests++;
+        const lx = dx * b.c + dz * b.s;
+        const lz = -dx * b.s + dz * b.c;
+        const ox = b.hx + r - Math.abs(lx);
+        const oz = b.hz + r - Math.abs(lz);
+        if (ox <= 0 || oz <= 0) { continue; }
+        // めり込みの浅い方へ出す
+        let nx = 0, nz = 0;
+        if (ox < oz) { nx = lx >= 0 ? ox : -ox; } else { nz = lz >= 0 ? oz : -oz; }
+        px += nx * b.c - nz * b.s;
+        pz += nx * b.s + nz * b.c;
+        this.collideStats.pushes++;
+        this.collideStats.maxPush = Math.max(this.collideStats.maxPush, Math.hypot(nx, nz));
+        moved = true;
+      }
+      if (!moved) { break; }
+    }
+    this.collideStats.msMax = Math.max(this.collideStats.msMax, performance.now() - t0);
+    return [px, pz];
+  };
+
+  /** 検証用: その点が当たり判定の塊の中に入っているか（押し戻しの取りこぼしの検出） */
+  private insideSolid(x: number, z: number, footY: number): boolean {
+    for (const b of this.solids) {
+      const dx = x - b.x, dz = z - b.z;
+      if (dx * dx + dz * dz > b.r * b.r) continue;
+      if (footY > b.y1 - 0.10 || footY + 1.55 < b.y0) continue;
+      const lx = dx * b.c + dz * b.s;
+      const lz = -dx * b.s + dz * b.c;
+      if (Math.abs(lx) < b.hx - 0.02 && Math.abs(lz) < b.hz - 0.02) return true;
+    }
+    return false;
+  }
 
   /** その地点が水（田の泥）か。焼いた材質を読む（world.wgsl の KIND_MUD = 1） */
   isWater = (x: number, z: number): boolean => {
@@ -2053,7 +2168,11 @@ export class WorldScene implements SceneRenderer {
         : this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : IDLE_INPUT;
       // 歩き手は位置と向きだけを持つ。足跡は歩幅で機械的に打たず、
       // 人物の足が実際に地面に着いた瞬間・着いた位置に打つ（フェーズ6 段階3）
-      this.walker.step(input, FIXED_DT, this.groundHeight);
+      this.walker.step(input, FIXED_DT, this.groundHeight, this.resolveCollision);
+      // 検証: 押し戻したあとで、まだ塊の中に居るフレームが無いこと
+      this.collideStats.frames++;
+      if (this.insideSolid(this.walker.x, this.walker.z, this.walker.y)) this.collideStats.insideFrames++;
+      if (this.decks.length > 0 && this.deckHeight(this.walker.x, this.walker.z) !== null) this.collideStats.onDeckFrames++;
       if (!this.view.fixedCam) {
         const cam = this.walker.camera(this.groundHeight, this.view.camDist);
         this.camera = { eye: cam.eye, forward: cam.forward };
@@ -2287,6 +2406,11 @@ export class WorldScene implements SceneRenderer {
         routeTotal: this.view.route ? this.view.route.length : 0,
       },
       figure: { vertices: this.figureVerts, ...this.figure.stats },
+      collide: {
+        ...this.collideStats,
+        maxPush: Number(this.collideStats.maxPush.toFixed(4)),
+        msMax: Number(this.collideStats.msMax.toFixed(3)),
+      },
       matL0: this.matL0 ? (() => {
         const h = new Array(11).fill(0);
         for (let i = 0; i < this.matL0.length; i += 37) h[Math.min(10, this.matL0[i])]++;
