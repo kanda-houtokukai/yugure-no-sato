@@ -8,7 +8,7 @@ const RAYLEIGH_H: f32 = 8000.0;
 const MIE_H: f32 = 1200.0;
 const BETA_R: vec3f = vec3f(5.802e-6, 13.558e-6, 33.1e-6);
 // 夏の夕方の靄。標準（3.996e-6）より濃くして、遠景が溶けるようにする
-const BETA_M: f32 = 1.0e-5;
+const BETA_M: f32 = 2.3e-5;
 const BETA_M_ABS: f32 = 0.5;    // 夏の靄は吸収性（煤・有機物）。直射を落とし、空の白飛びを抑える
 const BETA_O: vec3f = vec3f(0.650e-6, 1.881e-6, 0.085e-6);
 const MIE_G: f32 = 0.80;
@@ -22,10 +22,15 @@ struct Atmo {
   transmittance: vec3f,
 };
 
+/** 谷底に溜まる夏の夕暮れの靄。標高が低いほど濃い（遠景に層を作る） */
+const VALLEY_FOG_H: f32 = 75.0;
+const VALLEY_FOG_AMOUNT: f32 = 3.0;
+
 fn densities(h: f32) -> vec3f {
-  // x = Rayleigh, y = Mie, z = オゾン（25km を中心に幅 30km の三角）
+  // x = Rayleigh, y = Mie（高層の靄＋谷底の靄）, z = オゾン（25km を中心に幅 30km の三角）
   let hh = max(h, 0.0);
-  return vec3f(exp(-hh / RAYLEIGH_H), exp(-hh / MIE_H), max(0.0, 1.0 - abs(hh - 25000.0) / 15000.0));
+  let mie = exp(-hh / MIE_H) + VALLEY_FOG_AMOUNT * exp(-hh / VALLEY_FOG_H);
+  return vec3f(exp(-hh / RAYLEIGH_H), mie, max(0.0, 1.0 - abs(hh - 25000.0) / 15000.0));
 }
 
 fn phaseRayleigh(mu: f32) -> f32 { return 3.0 / (16.0 * PI) * (1.0 + mu * mu); }
