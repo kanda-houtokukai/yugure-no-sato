@@ -359,9 +359,9 @@ export class WorldScene implements SceneRenderer {
     });
     this.camera = { eye: [eyeXZ[0], eyeGround + this.view.eye.above, eyeXZ[1]], forward: dirFromAzEl(this.view.yawDeg, this.view.pitchDeg) };
     // 歩き手の初期位置は視点の足元
-    this.walker.x = eyeXZ[0];
-    this.walker.z = eyeXZ[1];
-    this.walker.yawDeg = this.view.yawDeg;
+    this.walker.x = this.view.walkFrom ? this.view.walkFrom.x : eyeXZ[0];
+    this.walker.z = this.view.walkFrom ? this.view.walkFrom.z : eyeXZ[1];
+    this.walker.yawDeg = this.view.walkYaw ?? this.view.yawDeg;
     this.updateFrame();
 
     // --- 描画先 ---
@@ -1774,15 +1774,13 @@ export class WorldScene implements SceneRenderer {
     if (walking) {
       // 実操作モードでは筋書きより実操作を優先する
       const input = this.live ? this.liveInput : this.view.script ? scriptInput(this.view.script, ctx.frameIndex) : IDLE_INPUT;
-      const falls = this.walker.step(input, FIXED_DT, this.groundHeight);
-      for (const f of falls) {
-        if (this.footfallLog.length < 400) this.footfallLog.push({ f: ctx.frameIndex, x: f.x, z: f.z, side: f.side });
-        this.addStamp(f.x, f.z, 0.15, 0, f.dirX, f.dirZ, 0.12, 0.9);
-        // 体が通った跡（倒すだけ）
-        this.addStamp(this.walker.x, this.walker.z, 0.42, 1, f.dirX, f.dirZ, 0, 0.85);
+      // 歩き手は位置と向きだけを持つ。足跡は歩幅で機械的に打たず、
+      // 人物の足が実際に地面に着いた瞬間・着いた位置に打つ（フェーズ6 段階3）
+      this.walker.step(input, FIXED_DT, this.groundHeight);
+      if (!this.view.fixedCam) {
+        const cam = this.walker.camera(this.groundHeight, this.view.camDist);
+        this.camera = { eye: cam.eye, forward: cam.forward };
       }
-      const cam = this.walker.camera(this.groundHeight, this.view.camDist);
-      this.camera = { eye: cam.eye, forward: cam.forward };
       // 人物: 歩き手の位置・向き・進んだ距離から姿勢を組む
       this.figure.step({
         x: this.walker.x, z: this.walker.z,
@@ -1790,6 +1788,17 @@ export class WorldScene implements SceneRenderer {
         moved: this.walker.lastMoved, running: this.walker.lastRunning, dt: FIXED_DT,
         groundHeight: this.groundHeight, isWater: this.isWater,
       });
+      // 足が着いた瞬間に足跡を打つ。水の中は深く踏み抜き、波紋が立つ
+      // （波紋は deform-update が材質を見て自動で起こす）
+      for (const f of this.figure.plants) {
+        if (this.footfallLog.length < 400) {
+          this.footfallLog.push({ f: ctx.frameIndex, x: Number(f.x.toFixed(3)), z: Number(f.z.toFixed(3)), side: f.side });
+        }
+        this.addStamp(f.x, f.z, f.inWater ? 0.20 : 0.15, 0, f.dirX, f.dirZ, f.inWater ? 0.16 : 0.12, 0.9);
+        // 体が通った跡（草を倒すだけ）
+        this.addStamp(this.walker.x, this.walker.z, 0.42, 1, f.dirX, f.dirZ, 0, 0.85);
+      }
+      this.figure.plants.length = 0;
       const fm = this.figure.meshData();
       this.figureVerts = Math.min(fm.length / VERTEX_FLOATS, WorldScene.FIGURE_MAX_VERTS);
       this.device.queue.writeBuffer(this.figureMesh, 0, fm, 0, this.figureVerts * VERTEX_FLOATS);
@@ -1985,6 +1994,11 @@ export class WorldScene implements SceneRenderer {
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
       figure: { vertices: this.figureVerts, ...this.figure.stats },
+      matL0: this.matL0 ? (() => {
+        const h = new Array(11).fill(0);
+        for (let i = 0; i < this.matL0.length; i += 37) h[Math.min(10, this.matL0[i])]++;
+        return { sampled: Math.ceil(this.matL0.length / 37), kinds: h };
+      })() : null,
       footfalls: this.footfallLog,
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {

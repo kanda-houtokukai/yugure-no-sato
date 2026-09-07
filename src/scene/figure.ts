@@ -7,6 +7,7 @@
 // 接地の間はそこに固定する。腰の高さと傾きは、左右の足の高さから決める。
 
 import { MeshBuilder, type V3 } from './mesh';
+import { Walker } from './walker';
 
 // 材質の種別（building.wgsl の kind）
 export const MAT_CLOTH = 17;    // 藍の野良着・もんぺ
@@ -80,6 +81,9 @@ interface Leg {
   st: number;
   /** 接地の進み 0..1。踵を返すタイミングに使う */
   ct: number;
+  /** 位相による振り出しを受け付ける状態か。着地したら下ろし、位相窓を出たら戻す。
+   *  これが無いと、振り出しが窓より早く終わったとき同じ脚が続けて振り出す（実測） */
+  armed: boolean;
   /** 踵の浮き [m] */
   heel: number;
   /** 現在の足の位置（描画に使う） */
@@ -90,8 +94,8 @@ export class Figure {
   /** 歩容の位相 0..1（1 周で左右 1 歩ずつ） */
   private phase = 0;
   private legs: Leg[] = [
-    { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, swinging: false, st: 0, ct: 0, heel: 0, fx: 0, fy: 0, fz: 0 },
-    { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, swinging: false, st: 0, ct: 0, heel: 0, fx: 0, fy: 0, fz: 0 },
+    { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, swinging: false, st: 0, ct: 0, heel: 0, armed: true, fx: 0, fy: 0, fz: 0 },
+    { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, swinging: false, st: 0, ct: 0, heel: 0, armed: true, fx: 0, fy: 0, fz: 0 },
   ];
   private bodyYaw = 0;
   private headYaw = 0;
@@ -113,6 +117,10 @@ export class Figure {
     groundMin: 1e9, groundMax: -1e9,
     /** 腰の高さ − 足元の地面。歩容だけの上下（地形の起伏を除く） */
     aboveMin: 1e9, aboveMax: -1e9,
+    /** 腰の高さ − 支えている足。地形も歩幅の前後も除いた、純粋な上下動 */
+    overFootMin: 1e9, overFootMax: -1e9,
+    /** 最小になった瞬間の脚の状態（何が腰を下げているか） */
+    lowWhy: '',
   };
 
   private mesh = new MeshBuilder();
@@ -131,7 +139,7 @@ export class Figure {
   /** 1 フレーム進める。戻り値は腰の高さ（世界座標） */
   step(s: FigureStep): void {
     this.time += s.dt;
-    const stepLen = s.running ? 1.25 : 0.85;
+    const stepLen = s.running ? Walker.STEP_RUN : Walker.STEP_WALK;
     const swingFrac = s.running ? 0.62 : 0.48;
     const speed = s.moved / Math.max(s.dt, 1e-6);
     const moving = s.moved > 1e-5;
@@ -193,12 +201,23 @@ export class Figure {
       const otherOk = !this.legs[1 - i].swinging || this.legs[1 - i].st > 0.65;
       // その場で速く向きを変えると、両足とも踏み替えたい状況が起きる。
       // 片足ずつに縛ると脚が伸びきり、腰が 0.7m 沈んだ（実測）。深刻なときは同時を許す
+      // 閾値は「歩行で自然に生じる前後の振れ」より大きく取る。
+      // ahead（= stepLen×(1-swingFrac) ≒ 0.44m）より小さくすると、
+      // 接地の終わりに毎回よけいな踏み替えが起きて左右が交互にならない（実測）
+      if (local >= swingFrac) l.armed = true;   // 位相窓を出たので次の振り出しを受け付ける
+      // 歩行で自然に生じる前後の振れは ahead（≒0.44m）まで。それを超えたら位相を待たずに踏み替える。
+      // 歩き始めは両足が揃っているので、片脚の接地が 1 m 以上続いて脚が伸びきる（実測）
+      const strayTrigger = (stray > 0.50 && otherOk) || stray > 0.66;
       const wantSwing = moving
-        ? local < swingFrac || (stray > 0.40 && otherOk) || stray > 0.58
+        ? (local < swingFrac && l.armed) || strayTrigger
         : (stray > 0.36 && otherOk) || stray > 0.58;
 
       if (wantSwing && !l.swinging) {
+        // 位相を待たずに踏み替えたときは、位相をこの脚に合わせ直す。
+        // 合わせないと以後ずっと左右が揃わない
+        if (strayTrigger && local >= swingFrac) this.phase = i === 0 ? 0 : 0.5;
         l.swinging = true;
+        l.armed = false;
         l.st = 0;
         l.ct = 0;
         l.qx = l.px; l.qy = l.py; l.qz = l.pz;
@@ -262,6 +281,9 @@ export class Figure {
     let hipY = support + HIP_STAND - ANKLE - bob;
     // 脚の伸びで腰を落とすのは自然だが、落とし過ぎは「しゃがみ」になる。18cm で止める
     const hipFloor = support + HIP_STAND - ANKLE - 0.18;
+    const nominal = hipY;
+    const limits: number[] = [];
+    const dhs: number[] = [];
     for (let i = 0; i < 2; i++) {
       const l = this.legs[i];
       const sd = this.legSide(i) * HIP_HALF;
@@ -269,7 +291,9 @@ export class Figure {
       const dh = Math.hypot(jx - l.fx, jz - l.fz);
       const maxUp = REACH * 0.985;
       const dy = Math.sqrt(Math.max(0.0025, maxUp * maxUp - dh * dh));
-      hipY = Math.min(hipY, l.fy + ANKLE + l.heel + dy);
+      const lim = l.fy + ANKLE + l.heel + dy;
+      limits.push(lim); dhs.push(dh);
+      hipY = Math.min(hipY, lim);
     }
     hipY = Math.max(hipY, hipFloor);
     this.stats.hipY = hipY;
@@ -278,6 +302,12 @@ export class Figure {
     this.stats.groundMax = Math.max(this.stats.groundMax, g);
     this.stats.aboveMin = Math.min(this.stats.aboveMin, hipY - g);
     this.stats.aboveMax = Math.max(this.stats.aboveMax, hipY - g);
+    if (hipY - support < this.stats.overFootMin) {
+      this.stats.overFootMin = hipY - support;
+      this.stats.lowWhy = `nominal=${(nominal - support).toFixed(3)} `
+        + this.legs.map((l, i) => `脚${i}${l.swinging ? '振' : '接'} dh=${dhs[i].toFixed(3)} 踵=${l.heel.toFixed(3)} 限=${(limits[i] - support).toFixed(3)}`).join(' | ');
+    }
+    this.stats.overFootMax = Math.max(this.stats.overFootMax, hipY - support);
     if (hipY < this.stats.hipMin) {
       this.stats.hipMin = hipY;
       this.stats.hipMinT = Number(this.time.toFixed(2));
@@ -306,6 +336,7 @@ export class Figure {
     const P = (x: number, y: number, z: number): V3 => [x - ox, y - oy, z - oz];
 
     const moving = s.moved > 1e-5;
+    const speed = s.moved / Math.max(s.dt, 1e-6);
     const leanX = fx * this.lean, leanZ = fz * this.lean;
 
     // 骨盤: 傾き（roll）を左右方向に効かせる
@@ -356,8 +387,16 @@ export class Figure {
       0.150, 0.182, 12, MAT_CLOTH);
 
     // --- 腕（脚と逆位相に振る） ---
-    const swingAmp = running ? 0.95 : 0.55;
+    // 位相の対応: 左脚は phase 0 で最も後ろ、0.5 で最も前（振り出しが 0〜swingFrac）。
+    // よって左腕は cos(2πphase)、右腕は -cos(2πphase) で「右足が前なら左腕が前」になる。
+    // sin を使うと 1/4 周期ずれ、足と腕の関係が崩れる（実測で外していた）
     const armPhase = 2 * Math.PI * this.phase;
+    // 遠景ではシルエットしか見えず、腕の振りが「歩いている」ことを伝える主な手がかりになる。
+    // 実寸の歩行（±20°前後）より一段大きく振る
+    const ampScale = clamp(speed / 2.2, 0.35, 1.6);
+    // [m] 肘の前後の振れ幅。上腕の長さ（0.30m）に近づけると肩の角度が 60°を超え、
+    // 行進に見える（実測）。歩行で肩角 ±30°、走りで ±45° に収まる値にする
+    const swingAmp = (running ? 0.212 : 0.150) * ampScale;
     for (let i = 0; i < 2; i++) {
       const sd = this.legSide(i);
       // 肩の関節は胴の中に入れる。表面から出すと、腕と胴の間に隙間が見える
@@ -366,28 +405,36 @@ export class Figure {
         chest[1] + 0.038,
         chest[2] + crz * sd * (SHOULDER_HALF - 0.045),
       ];
-      // 脚が前なら腕は後ろ
-      const a = moving ? Math.sin(armPhase + (i === 0 ? Math.PI : 0)) * swingAmp
-        : 0.06 * Math.sin(this.time * 1.5 + i);
-      const fwdAmt = a * 0.30;
-      const down = 0.86;
+      const a = moving ? (i === 0 ? 1 : -1) * Math.cos(armPhase) * swingAmp
+        : 0.012 * Math.sin(this.time * 1.5 + i * Math.PI);
+      // 腕は肩を中心に振れる振り子。前後のずれを角度に直して長さを保つ
+      // （y を決め打ちにすると、前に振るほど腕が伸びる）
+      const t1 = Math.asin(clamp(a / UPPER_ARM, -0.92, 0.92));
+      // 真後ろから見ると前後の振れは短縮して見えない。後ろへ振るときに外へ開かせて、
+      // 三人称カメラ（ほぼ真後ろ）でも輪郭が動くようにする
+      const outSwing = 0.070 + 0.040 * Math.max(0, -a / Math.max(swingAmp, 1e-3));
       const elbow: V3 = [
-        sh[0] + cfx * fwdAmt + crx * sd * 0.048,
-        sh[1] - UPPER_ARM * down,
-        sh[2] + cfz * fwdAmt + crz * sd * 0.048,
+        sh[0] + cfx * Math.sin(t1) * UPPER_ARM + crx * sd * outSwing,
+        sh[1] - Math.cos(t1) * UPPER_ARM,
+        sh[2] + cfz * Math.sin(t1) * UPPER_ARM + crz * sd * outSwing,
       ];
-      // 肘は常に少し曲げ、腕が前に出るほど深く折る
-      const bend = (running ? 0.55 : 0.28) + Math.max(0, a) * 0.55;
+      // 肘は常に少し曲げ、腕が前に出るほど深く折る。走ると深い
+      const bend = (running ? 0.60 : 0.26) + Math.max(0, a / Math.max(swingAmp, 1e-3)) * (running ? 0.75 : 0.45);
+      const t2 = t1 + bend;
       const wrist: V3 = [
-        elbow[0] + cfx * (fwdAmt * 0.5 + bend * 0.28) + crx * sd * 0.035,
-        elbow[1] - FOREARM * (1 - bend * 0.42),
-        elbow[2] + cfz * (fwdAmt * 0.5 + bend * 0.28) + crz * sd * 0.035,
+        elbow[0] + cfx * Math.sin(t2) * FOREARM + crx * sd * (outSwing * 0.62),
+        elbow[1] - Math.cos(t2) * FOREARM,
+        elbow[2] + cfz * Math.sin(t2) * FOREARM + crz * sd * (outSwing * 0.62),
+      ];
+      const hand: V3 = [
+        wrist[0] + cfx * Math.sin(t2) * 0.085,
+        wrist[1] - Math.cos(t2) * 0.085,
+        wrist[2] + cfz * Math.sin(t2) * 0.085,
       ];
       // 袖（肘まで）と、そこから先の腕
       m.tube(P(sh[0], sh[1], sh[2]), P(elbow[0], elbow[1], elbow[2]), 0.068, 0.050, 8, MAT_CLOTH);
       m.tube(P(elbow[0], elbow[1], elbow[2]), P(wrist[0], wrist[1], wrist[2]), 0.046, 0.034, 6, MAT_SKIN);
-      m.tube(P(wrist[0], wrist[1], wrist[2]),
-        P(wrist[0] + cfx * 0.02, wrist[1] - 0.080, wrist[2] + cfz * 0.02), 0.040, 0.026, 6, MAT_SKIN);
+      m.tube(P(wrist[0], wrist[1], wrist[2]), P(hand[0], hand[1], hand[2]), 0.040, 0.026, 6, MAT_SKIN);
     }
 
     // --- 首・頭・帽子 ---

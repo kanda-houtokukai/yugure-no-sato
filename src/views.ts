@@ -18,6 +18,12 @@ export interface View {
   readonly frames?: number;
   /** 三人称カメラの距離 [m]（既定 3.0）。人物を遠景で見せるときに伸ばす */
   readonly camDist?: number;
+  /** true なら筋書きを走らせても視点を動かさない（歩く人を任意の角度から見る） */
+  readonly fixedCam?: boolean;
+  /** 歩き手の出発点（世界座標）。視点を固定したときに使う */
+  readonly walkFrom?: { x: number; z: number };
+  /** 歩き手の進む向き [度]。視点を固定したとき、カメラの向きと切り離す */
+  readonly walkYaw?: number;
   /** 方位（北 = 0°, 東 = 90°）と仰角（度） */
   readonly yawDeg: number;
   readonly pitchDeg: number;
@@ -81,6 +87,11 @@ export function viewFromUrl(search: string): View {
     ...(b.snap && !eyeRaw ? { snap: b.snap } : {}),
     ...(b.glintCheck ? { glintCheck: true } : {}),
     ...(q.get('script') ?? b.script ? { script: q.get('script') ?? b.script } : {}),
+    ...(q.has('walkFrom') ? (() => {
+      const w = (q.get('walkFrom') ?? '').split(',').map(Number);
+      return w.length === 2 && w.every(Number.isFinite) ? { fixedCam: true, walkFrom: { x: w[0], z: w[1] } } : {};
+    })() : {}),
+    ...(q.has('walkYaw') ? { walkYaw: num(q, 'walkYaw', 0) } : {}),
     frames: num(q, 'frames', b.frames ?? 120),
     ...(q.has('camDist') ? { camDist: num(q, 'camDist', 3) } : b.camDist !== undefined ? { camDist: b.camDist } : {}),
     yawDeg: num(q, 'yaw', b.yawDeg),

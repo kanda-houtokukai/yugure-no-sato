@@ -11,15 +11,6 @@ export interface WalkerInput {
 
 export const IDLE_INPUT: WalkerInput = { forward: 0, strafe: 0, yawDelta: 0, pitchDelta: 0, run: false };
 
-export interface Footfall {
-  x: number;
-  z: number;
-  dirX: number;
-  dirZ: number;
-  /** 左足 = -1、右足 = +1 */
-  side: number;
-}
-
 export class Walker {
   x = 0;
   z = 0;
@@ -27,8 +18,6 @@ export class Walker {
   yawDeg = 0;
   /** カメラの見下ろし角（度）。歩き手の周りを回る三人称カメラ */
   pitchDeg = 12;
-  private stepAccum = 0;
-  private stepSide = 1;
   private lastDirX = 0;
   private lastDirZ = 1;
   /** 直前の 1 フレームで進んだ距離 [m]。人物の歩容が使う */
@@ -39,14 +28,17 @@ export class Walker {
   // 実寸（歩き 1.4m/s）だと画面では遅く感じる。体感に合わせて上げた（2026-09-07）
   static readonly WALK_SPEED = 2.2;   // m/s
   static readonly RUN_SPEED = 5.0;
-  /** 歩幅。速いほど広い（走りで足跡が刻まれすぎないように） */
+  /** 歩幅。歩容（figure.ts）が足の運びと足跡の間隔を決めるのに使う */
   static readonly STEP_WALK = 0.85;
   static readonly STEP_RUN = 1.25;
   static readonly CAMERA_DIST = 3.0;
   static readonly PIVOT_HEIGHT = 1.2;
 
-  /** 1 フレーム進める。groundHeight で足元の高さに追従。歩幅ごとに足跡を返す */
-  step(input: WalkerInput, dt: number, groundHeight: (x: number, z: number) => number): Footfall[] {
+  /**
+   * 1 フレーム進める。groundHeight で足元の高さに追従。
+   * 足跡はここでは打たない。人物（figure.ts）の足が実際に着いた瞬間に打つ（フェーズ6 段階3）。
+   */
+  step(input: WalkerInput, dt: number, groundHeight: (x: number, z: number) => number): void {
     this.yawDeg += input.yawDelta;
     this.pitchDeg = Math.max(-8, Math.min(60, this.pitchDeg + input.pitchDelta));
     const yaw = (this.yawDeg * Math.PI) / 180;
@@ -55,30 +47,18 @@ export class Walker {
     let mx = fx * input.forward + rx * input.strafe;
     let mz = fz * input.forward + rz * input.strafe;
     const len = Math.hypot(mx, mz);
-    const falls: Footfall[] = [];
     this.lastMoved = 0;
     this.lastRunning = input.run;
     if (len > 1e-6) {
       mx /= len; mz /= len;
       const speed = input.run ? Walker.RUN_SPEED : Walker.WALK_SPEED;
-      const stride = input.run ? Walker.STEP_RUN : Walker.STEP_WALK;
       const dist = speed * dt;
       this.x += mx * dist;
       this.z += mz * dist;
       this.lastDirX = mx; this.lastDirZ = mz;
       this.lastMoved = dist;
-      this.stepAccum += dist;
-      while (this.stepAccum >= stride) {
-        this.stepAccum -= stride;
-        this.stepSide = -this.stepSide;
-        // 進行方向に対して左右へ 0.12m
-        const sx = -mz * this.stepSide * 0.12;
-        const sz = mx * this.stepSide * 0.12;
-        falls.push({ x: this.x + sx, z: this.z + sz, dirX: mx, dirZ: mz, side: this.stepSide });
-      }
     }
     this.y = groundHeight(this.x, this.z);
-    return falls;
   }
 
   /** 三人称カメラ。歩き手の腰の高さを注視点に、後方・やや上から */
