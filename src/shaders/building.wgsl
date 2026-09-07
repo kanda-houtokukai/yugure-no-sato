@@ -157,6 +157,59 @@ fn fsBuilding(in: BVSOut) -> @location(0) vec4f {
     albedo = mix(vec3f(0.055, 0.085, 0.030), vec3f(0.105, 0.150, 0.055), g);
     n = normalize(n + tangentOf(n) * (g - 0.5) * 0.35);
     ao = 0.75;
+  } else if (kind == 10u) {  // 作物の葉: 逆光で透ける。夏の菜園なので濃く若い緑
+    let vein = gnoise(in.uv * vec2f(38.0, 7.0), 831u);
+    let tone = gnoise(in.uv * 3.0, 832u) * 0.5 + 0.5;
+    albedo = mix(vec3f(0.060, 0.125, 0.036), vec3f(0.115, 0.215, 0.062), tone);
+    albedo *= 0.86 + 0.24 * (vein * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * vein * 0.12);
+    ao = 0.82;
+    thatchRim = 1.6;   // 葉は薄いので、茅より強く透ける
+    spec = 0.05; rough = 0.35;
+  } else if (kind == 11u) {  // 竹: 淡い黄緑。節が一定間隔で入り、丸い面が硬く光る
+    let node = abs(fract(in.uv.y / 0.31) - 0.5) * 2.0;
+    let ring = smootherstep(0.86, 1.0, node);
+    let tone = gnoise(in.uv * vec2f(2.0, 0.8), 833u) * 0.5 + 0.5;
+    albedo = mix(vec3f(0.135, 0.140, 0.070), vec3f(0.215, 0.220, 0.115), tone);
+    albedo *= 1.0 - 0.34 * ring;
+    ao = 0.9;
+    spec = 0.13; rough = 0.26;
+  } else if (kind == 12u) {  // 藁・干し草: 乾いて色が抜けた金色。繊維が逆光で光る
+    let strand = gnoise(in.uv * vec2f(90.0, 6.0), 834u);
+    let tone = gnoise(in.uv * 2.4, 835u) * 0.5 + 0.5;
+    albedo = mix(vec3f(0.145, 0.115, 0.058), vec3f(0.235, 0.190, 0.098), tone);
+    albedo *= 0.82 + 0.30 * (strand * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * strand * 0.42 + cross(n, tangentOf(n)) * gnoise(in.uv * 40.0, 836u) * 0.18);
+    ao = 0.85;
+    thatchRim = 1.2;
+  } else if (kind == 13u) {  // 割った薪の木口: 白木。年輪が同心に走る
+    let d = length(in.uv - vec2f(0.0, 0.0));
+    let ringN = gnoise(vec2f(d * 46.0, 0.0), 837u);
+    albedo = mix(vec3f(0.190, 0.155, 0.108), vec3f(0.285, 0.240, 0.172), gnoise(in.uv * 5.0, 838u) * 0.5 + 0.5);
+    albedo *= 0.86 + 0.26 * (ringN * 0.5 + 0.5);
+    ao = 0.8;
+    spec = 0.02; rough = 0.6;
+  } else if (kind == 14u) {  // 耕した土: 掘り返して黒い。塊がごろごろしている
+    let clump = gnoise(in.uv * 16.0, 839u);
+    let coarse = gnoise(in.uv * 4.5, 840u) * 0.5 + 0.5;
+    // 掘り返した土。敷地の乾いた土（0.33〜0.46）より暗いが、黒くはしない。
+    // 0.19〜0.31 では夕日の斜光（高度 3.5°）で上向きの面が真っ黒に潰れた（実測）
+    albedo = mix(vec3f(0.255, 0.200, 0.140), vec3f(0.375, 0.300, 0.215), coarse);
+    albedo *= 0.84 + 0.28 * (clump * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * clump * 0.32 + cross(n, tangentOf(n)) * gnoise(in.uv * 21.0, 841u) * 0.30);
+    ao = 0.92;
+  } else if (kind == 15u) {  // 農具の刃: 使い込んだ鉄。鈍く硬く光る
+    let wear = gnoise(in.uv * 22.0, 842u) * 0.5 + 0.5;
+    albedo = mix(vec3f(0.028, 0.026, 0.026), vec3f(0.058, 0.052, 0.048), wear);
+    ao = 0.7;
+    spec = 0.42; rough = 0.18;
+  } else if (kind == 16u) {  // 薪の側面（樹皮）: 柱の黒い木より明るい、乾いた雑木
+    let bark = gnoise(in.uv * vec2f(4.0, 34.0), 843u);
+    albedo = mix(vec3f(0.105, 0.082, 0.058), vec3f(0.180, 0.142, 0.098), gnoise(in.uv * 3.0, 844u) * 0.5 + 0.5);
+    albedo *= 0.80 + 0.34 * (bark * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * bark * 0.20);
+    ao = 0.68;
+    spec = 0.02; rough = 0.66;
   } else {                   // 石
     albedo = mix(vec3f(0.145, 0.138, 0.128), vec3f(0.235, 0.225, 0.210), grain);
     ao = 0.8;

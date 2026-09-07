@@ -35,6 +35,9 @@ import {
   buildFarmhouse, buildLantern, buildShrine, buildStoneWall, buildTorii,
   type FarmhouseParams,
 } from './buildings';
+import {
+  buildDryingRack, buildStones, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
+} from './props';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
 import type { DeviceBundle } from '../gpu/device';
@@ -223,6 +226,8 @@ export class WorldScene implements SceneRenderer {
   private pathProfile: { where: string; v: number; road: number; side: number; rise: number }[] = [];
   /** 敷地の縁が崖になっていないかの横断測線 */
   private yardEdge: { where: string; drop: number; maxSlopeDeg: number; over: number }[] = [];
+  /** 据えた建物・小物の実座標（寄りの絵を撮るときの当たり先） */
+  private placements: { kind: string; u: number; v: number; x: number; z: number; y: number }[] = [];
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -1398,6 +1403,33 @@ export class WorldScene implements SceneRenderer {
       { kind: 'wall10', u: 60, v: -126, rot: deg(93), scale: 1.0 },
       { kind: 'wall10', u: 60.5, v: -139, rot: deg(88), scale: 1.0 },
       { kind: 'wall10', u: -60, v: -134, rot: deg(91), scale: 1.0 },
+      // --- 暮らしの跡（フェーズ6 段階1）。建物の footprint と主道（|u|<5）を避け、整列させない ---
+      // 菜園: 家の裏手と敷地の隅。日の当たる開けた場所
+      // 畝は南北に立てる。東西向きだと高度 3.5° の西日に対して両斜面とも日陰になり、
+      // 黒い帯にしか見えない（実測）。南北なら西面が夕日を受け、畝の形が読める
+      { kind: 'veg', u: -34, v: -120, rot: deg(97), scale: 1.0 },
+      { kind: 'veg2', u: 30, v: -128, rot: deg(-84), scale: 1.0 },
+      { kind: 'veg', u: -40, v: -148, rot: deg(86), scale: 0.9 },
+      // 干し場: 風の通る開けた場所
+      { kind: 'rack', u: -22, v: -117, rot: deg(96), scale: 1.0 },
+      { kind: 'rack', u: 32, v: -152, rot: deg(12), scale: 0.92 },
+      // 薪: 軒下・壁際に積む
+      { kind: 'wood', u: -20.5, v: -134, rot: deg(-84), scale: 1.0 },
+      { kind: 'wood', u: -33, v: -130, rot: deg(-64), scale: 0.85 },
+      { kind: 'wood', u: 19.5, v: -121, rot: deg(66), scale: 0.95 },
+      // 井戸: 主道の西、家々の間の共同の水場
+      { kind: 'well', u: -6, v: -138, rot: deg(20), scale: 1.0 },
+      // 農具: 壁に立てかける
+      { kind: 'tools', u: 7.5, v: -125, rot: deg(66), scale: 1.0 },
+      { kind: 'tools', u: -11, v: -149, rot: deg(-98), scale: 0.95 },
+      // 桶・籠
+      { kind: 'vessels', u: -8, v: -125, rot: deg(30), scale: 1.0 },
+      { kind: 'vessels', u: 20.5, v: -139, rot: deg(-50), scale: 0.95 },
+      { kind: 'vessels', u: -30, v: -145, rot: deg(70), scale: 1.0 },
+      // 庭石・踏み石
+      { kind: 'stones', u: -8, v: -130.5, rot: deg(0), scale: 1.0 },
+      { kind: 'stones', u: 26, v: -134, rot: deg(40), scale: 0.9 },
+      { kind: 'stones', u: -38, v: -126, rot: deg(-30), scale: 0.8 },
     ];
     // 石段の勾配は地形から決める（決め打ちだと埋まるか浮く）。下端と上端の高さを正本に問い合わせる
     const stairV0 = 240;
@@ -1436,6 +1468,15 @@ export class WorldScene implements SceneRenderer {
       lantern: buildLantern(707, 1.9),
       wall14: buildStoneWall(909, 14, 1.5),
       wall10: buildStoneWall(910, 10, 1.1),
+      // 暮らしの跡
+      veg: buildVegetablePatch(501, 3, 4.6),
+      veg2: buildVegetablePatch(502, 4, 3.4),
+      rack: buildDryingRack(511, 3.2),
+      wood: buildWoodpile(521, 2.4, 1.25),
+      well: buildWell(531),
+      tools: buildTools(541),
+      vessels: buildVessels(551),
+      stones: buildStones(561),
     };
     this.buildingDraws = [];
     const kindsStat: { name: string; vertices: number; instances: number }[] = [];
@@ -1455,6 +1496,11 @@ export class WorldScene implements SceneRenderer {
       kindsStat.push({ name, vertices: vertexCount, instances: mine.length });
     }
     this.buildingStats = { total: plan.length, kinds: kindsStat };
+    // 寄りの絵を撮るとき、谷座標 (u,v) から世界座標へ自分で換算すると必ずずれる。据えた実座標を出す
+    this.placements = plan.map((b, i) => ({
+      kind: b.kind, u: b.u, v: b.v,
+      x: Number(xz[i][0].toFixed(2)), z: Number(xz[i][1].toFixed(2)), y: Number(heights[i].toFixed(2)),
+    }));
   }
 
   /** 世界の方向 → 画素座標（画面外なら null） */
@@ -1870,6 +1916,7 @@ export class WorldScene implements SceneRenderer {
       stairs: this.stairInfo,
       pathProfile: this.pathProfile,
       yardEdge: this.yardEdge,
+      placements: this.placements,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
