@@ -193,24 +193,30 @@ export interface TreePlacement {
 export function planTrees(): TreePlacement[] {
   const r = rng(7);
   const out: TreePlacement[] = [];
-  // 参道の杉並木: 主道（縦線 0）の延長、v = 192〜256、両脇 ±3.6m、6.5m 間隔
-  for (let v = 192; v <= 256; v += 6.5) {
+  // 参道の杉並木: 主道（縦線 0）の延長、v = 192〜238、両脇 ±3.6m、6.5m 間隔
+  // （v > 240 は境内へ上がる石段の斜面なので空けておく＝フェーズ5）
+  for (let v = 192; v <= 238; v += 6.5) {
     for (const side of [-1, 1]) {
       out.push({ variant: r() < 0.5 ? 0 : 1, u: 0, v: v + (r() - 0.5) * 0.8, scale: 0.9 + 0.3 * r(), rotation: r() * Math.PI * 2, snap: { index: 0, offset: side * 3.6 } });
     }
   }
-  // 丘の上の杉の杜（参道の線から 6m 以上離す）
-  for (let i = 0; i < 30; i++) {
+  // 丘の上の杉の杜。境内（中心 (0,270)・半幅 34×24）の外側を囲むように
+  for (let i = 0; i < 34; i++) {
     const a = r() * Math.PI * 2;
-    const rad = Math.sqrt(r());
-    const u = Math.cos(a) * 34 * rad;
-    const v = 276 + Math.sin(a) * 22 * rad;
-    if (Math.abs(u) < 6 && v < 262) continue;
+    const rad = 1.0 + 0.55 * r();          // 境内の縁の外側
+    const u = Math.cos(a) * 46 * rad;
+    const v = 272 + Math.sin(a) * 34 * rad;
+    // 境内の中と、参道の線上は空ける
+    if (Math.abs(u) < 38 && Math.abs(v - 270) < 28) continue;
+    if (Math.abs(u) < 6 && v < 268) continue;
     out.push({ variant: r() < 0.5 ? 0 : 1, u, v, scale: 0.8 + 0.4 * r(), rotation: r() * Math.PI * 2 });
   }
-  // 里の広葉樹: 集落の敷地（南）
-  for (let i = 0; i < 12; i++) {
-    out.push({ variant: 2 + (r() < 0.5 ? 0 : 1), u: -85 + 170 * r(), v: -186 + 40 * r(), scale: 0.85 + 0.45 * r(), rotation: r() * Math.PI * 2 });
+  // 里の広葉樹: 集落の敷地の縁（屋敷林）。敷地の中央は家屋のために空ける（フェーズ5）
+  for (let i = 0; i < 14; i++) {
+    const side = r() < 0.5 ? -1 : 1;
+    const u = -88 + 176 * r();
+    const v = -132 + side * (26 + 8 * r());   // 敷地の南北の縁ぞい
+    out.push({ variant: 2 + (r() < 0.5 ? 0 : 1), u, v, scale: 0.85 + 0.45 * r(), rotation: r() * Math.PI * 2 });
   }
   // 丘の麓（北東）
   for (let i = 0; i < 10; i++) {

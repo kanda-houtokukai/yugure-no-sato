@@ -69,6 +69,47 @@ fn shrineHill(uv: vec2f) -> f32 {
   return 22.0 * (1.0 - smootherstep(0.0, 1.0, d));
 }
 
+// ---------- 整地された平地（建物を置く土地） ----------
+// 集落の敷地と神社の境内。田より一段高く、水はけのため平坦。ここに田・稲は来ない。
+// 主道と参道が貫くので、家屋・鳥居・石段（フェーズ5）を置く場所になる。
+
+const YARD_C: vec2f = vec2f(0.0, -132.0);       // 集落の敷地の中心（谷座標）
+const YARD_H: vec2f = vec2f(66.0, 26.0);        // 半幅
+const YARD_FEATHER: f32 = 13.0;                 // 縁の傾斜の幅 [m]。狭いと切り土が崖になる
+const PRECINCT_C: vec2f = vec2f(0.0, 270.0);    // 神社の境内
+const PRECINCT_H: vec2f = vec2f(34.0, 24.0);
+const PRECINCT_FEATHER: f32 = 8.0;              // 石段が上がる斜面の幅
+
+/** 角丸の矩形の内外。1 = 内側、0 = 外側。縁は低周波ノイズで乱して人工的な直線を避ける */
+fn flatMask(uv: vec2f, center: vec2f, half: vec2f, feather: f32, seed: u32) -> f32 {
+  let d = abs(uv - center) - half;
+  let outside = length(max(d, vec2f(0.0))) + min(max(d.x, d.y), 0.0);
+  // 縁を乱す（直線的な造成に見せない）。大小 2 つの波を重ねる
+  let wobble = 4.2 * gnoise(uv / 21.0, seed) + 1.4 * gnoise(uv / 7.0, seed + 5u);
+  return 1.0 - smootherstep(-feather, feather, outside + wobble);
+}
+
+/** 敷地の高さ: 隣の田より約 1m 高い平場 */
+fn yardLevel() -> f32 { return valleyFloor(YARD_C) + 0.85; }
+
+/** 境内の高さ: 丘の頂をならした平場 */
+fn precinctLevel() -> f32 {
+  let p = fromValley(PRECINCT_C);
+  return valleyFloor(PRECINCT_C) + hills(p, basinT(PRECINCT_C), 8.0) + shrineHill(PRECINCT_C) + 0.25;
+}
+
+struct FlatSite { w: f32, level: f32, kind: u32 };
+
+fn flatSite(uv: vec2f) -> FlatSite {
+  var f: FlatSite;
+  f.w = 0.0; f.level = 0.0; f.kind = KIND_GROUND;
+  let wy = flatMask(uv, YARD_C, YARD_H, YARD_FEATHER, 131u);
+  if (wy > 0.0) { f.w = wy; f.level = yardLevel(); f.kind = KIND_YARD; }
+  let wp = flatMask(uv, PRECINCT_C, PRECINCT_H, PRECINCT_FEATHER, 132u);
+  if (wp > f.w) { f.w = wp; f.level = precinctLevel(); f.kind = KIND_PRECINCT; }
+  return f;
+}
+
 // ---------- 田んぼの区画 ----------
 const SU: f32 = 26.0;   // 縦線（川を横切る向きの線）の間隔 [m]
 const SV: f32 = 17.0;   // 横線（川に沿う線）の間隔 [m]
@@ -132,7 +173,9 @@ fn resolveCell(uv: vec2f) -> Cell {
   let centerUV = vec2f(0.5 * (f32(i) + f32(iEnd)) * SU, 0.5 * (lineABase(j) + lineABase(j + 1)));
   let inRiverBand = j == 0;
   let inBasin = basinT(centerUV) < 0.93;
-  let isPaddy = inBasin && !inRiverBand;
+  // 整地した敷地・境内には田を作らない（水が敷地に流れ込まないよう、縁にも余裕を取る）
+  let onFlat = flatSite(centerUV).w > 0.15;
+  let isPaddy = inBasin && !inRiverBand && !onFlat;
 
   let base = quantize(valleyFloor(centerUV), 0.12);
   let level = base + (hash2f(vec2i(i, j), 54u) - 0.5) * 0.05;
@@ -193,6 +236,8 @@ const KIND_PATH: u32 = 3u;
 const KIND_RIVERBED: u32 = 4u;
 const KIND_HILL: u32 = 5u;
 const KIND_MOUNTAIN: u32 = 6u;
+const KIND_YARD: u32 = 7u;        // 集落の敷地（踏み固められた土）
+const KIND_PRECINCT: u32 = 8u;    // 神社の境内（玉砂利まじりの土）
 
 struct Surface {
   height: f32,
@@ -249,9 +294,24 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
     }
   }
 
-  // あぜ道は周囲より少し高い土手
+  // 整地: 自然な高さを平場へ寄せる。田の判定の後、道の前（道は敷地の上を通る）
+  let site = flatSite(uv);
+  if (site.w > 0.0) {
+    // 完全な平面にはしない。踏み固めた土のわずかな起伏を残す
+    let siteH = site.level + 0.06 * fbm(p, 3, 6.0, minWl, 141u);
+    h = mix(h, siteH, site.w);
+    if (site.w > 0.35) {
+      s.kind = site.kind;
+      s.wet = 0.0;
+      s.ridgeDist = 100.0;
+    }
+  }
+
+  // あぜ道は周囲より少し高い土手。敷地の上では敷地の高さを基準にする
+  // （基準を谷底のままにすると、一段高い敷地に道が埋もれて消える）
+  let pathBase = mix(floorH, site.level, site.w);
   if (t < 1.3) {
-    let path = nearestPath(uv, floorH);
+    let path = nearestPath(uv, pathBase);
     let hw = path.halfWidth * widen;
     let pathH = h + (path.top - h) * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
     if (path.dist < hw + 0.7 * widen && pathH > h) {
@@ -290,6 +350,8 @@ fn terrainAlbedo(p: vec2f, s: Surface) -> vec3f {
     case 4u: { return mix(vec3f(0.22, 0.20, 0.16), vec3f(0.32, 0.29, 0.24), n); }        // 川床
     case 5u: { return mix(vec3f(0.12, 0.20, 0.08), vec3f(0.22, 0.30, 0.11), n); }        // 丘（草と林）
     case 6u: { return mix(vec3f(0.09, 0.14, 0.09), vec3f(0.16, 0.20, 0.13), n); }        // 山（林）
+    case 7u: { return mix(vec3f(0.26, 0.21, 0.15), vec3f(0.37, 0.30, 0.21), n); }        // 集落の敷地（踏み固めた土）
+    case 8u: { return mix(vec3f(0.33, 0.31, 0.27), vec3f(0.45, 0.42, 0.37), n); }        // 境内（玉砂利まじり）
     default: { return mix(vec3f(0.20, 0.30, 0.09), vec3f(0.32, 0.38, 0.14), n); }        // 草地
   }
 }
