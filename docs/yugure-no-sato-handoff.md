@@ -221,11 +221,13 @@ bird は 19.04ms（俯瞰は歩かない視点なので許容）。
 フェーズ全体の前後比較で見せ場を確認する。
 
 **フェーズ4のスクショ sha256（2026-09-07 09:34 時点。透過の調整後は下記の最終版）**
-- front `46baaafdcd25aadd3f00b4ab0daa98adeecd462d4ac47a0cda6ebab08c5f596e`
-- bird `aa810253e39dcde79cbdecff2fdb6fc839a0d8cd3ee36af5690652b3dfddc2d3`
-- ground `b935e5a9008c6329bfc5ecb4e44a115bcd7226b4ceef47099c4c69ee08866155`
-- water `80d7e9817bd794230abb97abee9cf96faf80e77b88cfc421defdf9e4091d0155`
-- walk `f70459dd52e431655e57e3e078ffe278511ab9b28d22b02c9f757b5cc823cc84`
+- front `47be7e208e1f09eb91554060799bc6d9cf58613172b1554b36f99deb3d9a4d9d`
+- bird `1618e20ffb6abf59b0ee5ad183a0cfaa204d88c7e4a6cb1ea1351034fea418af`
+- ground `066f7fb83c06317f777e44eb905a1f1ee9dd53f21519d71c27a51014495a39fc`
+- water `d75885f060b950b51e20386bf28e9419dfa1604ac225d796ba2fb1b457c0cd99`
+- walk `658459836831b5a7026f65b92dff04937f09eaac3ce10d18d96227da750ebf14`
+
+**最終の性能（DPR2・2560×1440）**: front 16.40 / bird 19.03 / ground 16.67 / water 13.15 / walk 13.74 ms
 
 ## 2026-09-07 — 割り込み: 実操作が有効にならない件（完了・commit 済み）
 
