@@ -91,7 +91,7 @@ const CELL_GRID_V = 3;
 /** 小川の帯: x の範囲と間隔、半幅（水面の半幅 2.6m より広く取り、土手の下に隠す） */
 const RIVER_X0 = -900;
 const RIVER_X1 = 900;
-const RIVER_STEP = 4;
+const RIVER_STEP = 1.5;   // 川の帯の刻み。粗いと岸の縁が階段状に見える（実測で 4m → 1.5m）
 const RIVER_HALF = 3.2;
 const RIVER_LEVEL = -1.0;
 

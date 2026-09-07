@@ -31,7 +31,7 @@ fn rippleNormal(p: vec2f, footprint: f32) -> vec3f {
   let amps = array<f32, 4>(0.0016, 0.0011, 0.0007, 0.0004);
   for (var i = 0; i < 4; i++) {
     let w = waves[i];
-    let visible = smootherstep(2.0, 8.0, w.z / footprint);
+    let visible = smootherstep(1.2, 5.0, w.z / footprint);
     if (visible <= 0.0) { continue; }
     let k = TAU / w.z;
     let phase = dot(p, w.xy) * k + t * w.w;
@@ -39,8 +39,19 @@ fn rippleNormal(p: vec2f, footprint: f32) -> vec3f {
     dx += w.x * slope;
     dz += w.y * slope;
   }
-  // 風の場（焼いたもの 1 タップ）で波を強弱させる。稲を渡る風と同じ場
-  let gust = 0.4 + 0.8 * windAt(p).strength;
+  // ごく細かいさざ波（間近でだけ見える）
+  let fine = smootherstep(1.2, 4.0, 0.11 / footprint);
+  if (fine > 0.0) {
+    let kf = TAU / 0.11;
+    let ph = dot(p, vec2f(0.72, -0.69)) * kf + t * 0.42;
+    let sl = 0.00018 * kf * cos(ph) * fine;
+    dx += 0.72 * sl;
+    dz += -0.69 * sl;
+  }
+  // 風の場（焼いたもの 1 タップ）で波を強弱させる。稲を渡る風と同じ場。
+  // さらに低周波の「凪の帯」を掛けて、鏡のような面と風で乱れた面を混在させる
+  let calm = 0.45 + 0.55 * gnoise(p / 38.0 + vec2f(t * 0.018, 0.0), 93u);
+  let gust = (0.10 + 1.7 * windAt(p).strength) * calm;
   return normalize(vec3f(-dx * gust, 1.0, -dz * gust));
 }
 
@@ -85,11 +96,16 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let mud = vec3f(0.12, 0.10, 0.07) * (sunLight + ambient);
   // 濁り: 水中で散った光の色。深さ 0.12m の田なので泥の色が半分ほど残る
   let murk = vec3f(0.20, 0.18, 0.11) * ambient * 0.6;
-  let depthFactor = exp(-vec3f(2.4, 2.0, 3.4) * (0.12 + df.sink) * 2.0 / max(cosTheta, 0.1));
+  // 畦の際は浅い。水深が小さいほど水底の泥が透けて暖色になる
+  let shallow = 1.0 - smootherstep(0.0, 2.4, baked.ridgeDist);
+  let depth = mix(0.12, 0.025, shallow) + df.sink;
+  let depthFactor = exp(-vec3f(2.4, 2.0, 3.4) * depth * 2.0 / max(cosTheta, 0.1));
   var under = mix(murk, mud * depthFactor, 0.55);
   // 濁り: 舞い上がった泥の色が水中で散る
   let stirred = vec3f(0.30, 0.24, 0.13) * ambient * 0.9;
   under = mix(under, stirred, df.turbidity * 0.75);
+  // 浅い縁では水底の泥の色が前に出る
+  under = mix(under, mud * 1.35 + murk * 0.4, shallow * 0.55);
 
   // 畦の際は水面も空が見えにくい（映り込みが弱まり、水底の色が出る）
   let edgeAo = 0.55 + 0.45 * smootherstep(0.0, 1.4, baked.ridgeDist);
