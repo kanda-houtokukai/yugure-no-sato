@@ -31,6 +31,10 @@ export class Walker {
   private stepSide = 1;
   private lastDirX = 0;
   private lastDirZ = 1;
+  /** 直前の 1 フレームで進んだ距離 [m]。人物の歩容が使う */
+  lastMoved = 0;
+  /** 直前の入力が走りだったか */
+  lastRunning = false;
 
   // 実寸（歩き 1.4m/s）だと画面では遅く感じる。体感に合わせて上げた（2026-09-07）
   static readonly WALK_SPEED = 2.2;   // m/s
@@ -52,6 +56,8 @@ export class Walker {
     let mz = fz * input.forward + rz * input.strafe;
     const len = Math.hypot(mx, mz);
     const falls: Footfall[] = [];
+    this.lastMoved = 0;
+    this.lastRunning = input.run;
     if (len > 1e-6) {
       mx /= len; mz /= len;
       const speed = input.run ? Walker.RUN_SPEED : Walker.WALK_SPEED;
@@ -60,6 +66,7 @@ export class Walker {
       this.x += mx * dist;
       this.z += mz * dist;
       this.lastDirX = mx; this.lastDirZ = mz;
+      this.lastMoved = dist;
       this.stepAccum += dist;
       while (this.stepAccum >= stride) {
         this.stepAccum -= stride;
@@ -75,12 +82,12 @@ export class Walker {
   }
 
   /** 三人称カメラ。歩き手の腰の高さを注視点に、後方・やや上から */
-  camera(groundHeight: (x: number, z: number) => number): { eye: [number, number, number]; forward: [number, number, number] } {
+  camera(groundHeight: (x: number, z: number) => number, dist = Walker.CAMERA_DIST): { eye: [number, number, number]; forward: [number, number, number] } {
     const yaw = (this.yawDeg * Math.PI) / 180;
     const p = (this.pitchDeg * Math.PI) / 180;
     const fx = Math.sin(yaw), fz = Math.cos(yaw);
     const pivot: [number, number, number] = [this.x, this.y + Walker.PIVOT_HEIGHT, this.z];
-    const d = Walker.CAMERA_DIST;
+    const d = dist;
     let ex = pivot[0] - fx * d * Math.cos(p);
     let ez = pivot[2] - fz * d * Math.cos(p);
     let ey = pivot[1] + d * Math.sin(p);

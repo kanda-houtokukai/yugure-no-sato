@@ -16,6 +16,8 @@ export interface View {
   readonly script?: string;
   /** 描画フレーム数（既定 120）。筋書きの長さに合わせる */
   readonly frames?: number;
+  /** 三人称カメラの距離 [m]（既定 3.0）。人物を遠景で見せるときに伸ばす */
+  readonly camDist?: number;
   /** 方位（北 = 0°, 東 = 90°）と仰角（度） */
   readonly yawDeg: number;
   readonly pitchDeg: number;
@@ -62,7 +64,7 @@ function num(q: URLSearchParams, key: string, fallback: number): number {
 
 /**
  * URL から視点を決める。`?view=front` で名前指定。
- * `eye=x,z,above` `yaw` `pitch` `fov` `t` `sunAz` `sunEl` `exposure` `dbg` で個別に上書きできる。
+ * `eye=x,z,above` `yaw` `pitch` `fov` `t` `sunAz` `sunEl` `exposure` `dbg` `frames` `script` `camDist` で個別に上書きできる。
  */
 export function viewFromUrl(search: string): View {
   const q = new URLSearchParams(search);
@@ -80,6 +82,7 @@ export function viewFromUrl(search: string): View {
     ...(b.glintCheck ? { glintCheck: true } : {}),
     ...(q.get('script') ?? b.script ? { script: q.get('script') ?? b.script } : {}),
     frames: num(q, 'frames', b.frames ?? 120),
+    ...(q.has('camDist') ? { camDist: num(q, 'camDist', 3) } : b.camDist !== undefined ? { camDist: b.camDist } : {}),
     yawDeg: num(q, 'yaw', b.yawDeg),
     pitchDeg: num(q, 'pitch', b.pitchDeg),
     fovDeg: num(q, 'fov', b.fovDeg),

@@ -93,6 +93,8 @@ fn fsBuilding(in: BVSOut) -> @location(0) vec4f {
   // 反射の質を材質ごとに変える。西日を正面から受けると、明るさだけの差では全部オレンジに寄る
   var rough = 1.0;      // 1 = 完全拡散、小さいほど硬く光る
   var thatchRim = 0.0;  // 茅の縁の透け
+  // 透けを面全体に乗せるか、輪郭だけに絞るか（0 に近いほど輪郭だけ＝シルエットになる）
+  var rimEdge = 0.35;
   var spec = 0.0;       // 鏡面の強さ
   let grain = gnoise(in.uv * 7.0, 811u) * 0.5 + 0.5;
 
@@ -210,6 +212,33 @@ fn fsBuilding(in: BVSOut) -> @location(0) vec4f {
     n = normalize(n + tangentOf(n) * bark * 0.20);
     ao = 0.68;
     spec = 0.02; rough = 0.66;
+  } else if (kind == 17u) {  // 野良着・もんぺ: 藍の木綿。逆光で縁がほつれて光る
+    let weave = gnoise(in.uv * vec2f(150.0, 150.0), 851u);
+    let fold = gnoise(in.uv * 6.0, 852u) * 0.5 + 0.5;
+    albedo = mix(vec3f(0.020, 0.026, 0.040), vec3f(0.052, 0.062, 0.090), fold);
+    albedo *= 0.86 + 0.24 * (weave * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * gnoise(in.uv * 9.0, 853u) * 0.16);
+    // 逆光のシルエットにする。面は沈み、輪郭だけがほつれて光る
+    ao = 0.50;
+    thatchRim = 1.4; rimEdge = 0.05;
+  } else if (kind == 18u) {  // 麦わら帽子: 編んだ麦稈。逆光で縁が透けて光る（形で農夫と読ませる）
+    let braid = gnoise(in.uv * vec2f(60.0, 18.0), 854u);
+    albedo = mix(vec3f(0.135, 0.108, 0.055), vec3f(0.225, 0.180, 0.095), gnoise(in.uv * 3.0, 855u) * 0.5 + 0.5);
+    albedo *= 0.82 + 0.30 * (braid * 0.5 + 0.5);
+    n = normalize(n + tangentOf(n) * braid * 0.28);
+    // 麦稈は薄いので、つばの縁が透けて光る。面は沈める
+    ao = 0.62;
+    thatchRim = 2.0; rimEdge = 0.14;
+    spec = 0.05; rough = 0.4;
+  } else if (kind == 19u) {  // 肌: 陽に灼けた腕と首。顔は作らない
+    albedo = mix(vec3f(0.075, 0.048, 0.032), vec3f(0.130, 0.086, 0.058), grain);
+    ao = 0.55;
+    thatchRim = 0.9; rimEdge = 0.05;
+    spec = 0.05; rough = 0.42;
+  } else if (kind == 20u) {  // 手ぬぐい: 晒し木綿。薄いので逆光で強く透ける
+    albedo = vec3f(0.24, 0.228, 0.205) * (0.88 + 0.20 * grain);
+    ao = 0.70;
+    thatchRim = 2.4; rimEdge = 0.22;
   } else {                   // 石
     albedo = mix(vec3f(0.145, 0.138, 0.128), vec3f(0.235, 0.225, 0.210), grain);
     ao = 0.8;
@@ -229,7 +258,7 @@ fn fsBuilding(in: BVSOut) -> @location(0) vec4f {
     let back = max(dot(-n, sun), 0.0);
     let toward = pow(max(dot(v, -sun), 0.0), 2.5);
     let edge = pow(1.0 - max(dot(n, v), 0.0), 2.0);   // 視線とすれる面（軒先の断面・けらば）
-    let rim = (0.55 * back + 1.35 * toward * back) * (0.35 + 0.65 * edge);
+    let rim = (0.55 * back + 1.35 * toward * back) * (rimEdge + (1.0 - rimEdge) * edge);
     color += vec3f(0.62, 0.50, 0.30) * rim * sunLight * 0.20;
   }
 

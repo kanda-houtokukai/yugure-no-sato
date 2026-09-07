@@ -38,6 +38,7 @@ import {
 import {
   buildDryingRack, buildStones, buildTools, buildVegetablePatch, buildVessels, buildWell, buildWoodpile,
 } from './props';
+import { Figure } from './figure';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
 import type { DeviceBundle } from '../gpu/device';
@@ -249,6 +250,12 @@ export class WorldScene implements SceneRenderer {
   private frameIndex = 0;
   /** 歩き手（変形を起こす主体）。筋書きまたは実操作で動く */
   readonly walker = new Walker();
+  /** 歩く人。毎フレーム姿勢からメッシュを組み直して 1 体だけ描く */
+  readonly figure = new Figure();
+  private figureMesh!: GPUBuffer;
+  private figureInst!: GPUBuffer;
+  private figureVerts = 0;
+  private static readonly FIGURE_MAX_VERTS = 4096;
   /** 実操作モード（play.ts）が true にし、毎フレーム liveInput を差し込む */
   live = false;
   liveInput: WalkerInput = { ...IDLE_INPUT };
@@ -256,6 +263,8 @@ export class WorldScene implements SceneRenderer {
   private camera = { eye: [0, 0, 0] as Vec3, forward: [0, 0, 1] as Vec3 };
   /** 近景段の高さテクスチャの CPU 複製（足元の高さ用。毎フレームの GPU 同期を避ける） */
   private l0: { origin: [number, number]; texel: number; size: number; data: Float32Array } | null = null;
+  /** 焼いた材質の近景段（種別のみ）。人物の足元が水かの判定に使う */
+  private matL0: Uint8Array | null = null;
   private waterBuffer!: GPUBuffer;
   private waterVertexCount = 0;
   private waterStats = { paddyCells: 0, riverSamples: 0, triangles: 0 };
@@ -337,6 +346,11 @@ export class WorldScene implements SceneRenderer {
     // --- 建物（同じく数値から。敷地・境内に建てる） ---
     await this.buildBuildings();
     await this.measurePathProfile();
+    this.figureMesh = device.createBuffer({
+      size: WorldScene.FIGURE_MAX_VERTS * VERTEX_FLOATS * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.figureInst = device.createBuffer({ size: 32, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
 
     // --- 定数バッファ ---
     this.frameBuffer = device.createBuffer({
@@ -1033,7 +1047,8 @@ export class WorldScene implements SceneRenderer {
     });
     this.matTex = device.createTexture({
       size: [HM_SIZE, HM_SIZE, layers], format: 'rgba8unorm',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+      // COPY_SRC: 近景段を CPU に読み戻す（人物の足元が水かの判定）
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
     const bakeLayout = device.createBindGroupLayout({
       entries: [
@@ -1069,10 +1084,29 @@ export class WorldScene implements SceneRenderer {
       pass.dispatchWorkgroups(HM_SIZE / 8, HM_SIZE / 8);
       pass.end();
     }
+    // 近景段（L0）の材質を CPU に読み戻す。人物の足が水（田の泥）に入ったかを毎フレーム判定する。
+    // 数式を TS に複製しない約束なので、焼いた結果を読む（高さと同じやり方）
+    const matBytes = HM_SIZE * HM_SIZE * 4;
+    const matRead = device.createBuffer({ size: matBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    encoder.copyTextureToBuffer(
+      { texture: this.matTex, origin: [0, 0, 0] },
+      { buffer: matRead, bytesPerRow: HM_SIZE * 4, rowsPerImage: HM_SIZE },
+      { width: HM_SIZE, height: HM_SIZE, depthOrArrayLayers: 1 },
+    );
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
     this.lightBakeMs = performance.now() - t0;
     for (const b of scratch) b.destroy();
+    await matRead.mapAsync(GPUMapMode.READ);
+    {
+      const rgba = new Uint8Array(matRead.getMappedRange());
+      const kinds = new Uint8Array(HM_SIZE * HM_SIZE);
+      // a = kind / 10 を 8bit に丸めたもの。戻して整数の種別にする
+      for (let i = 0; i < kinds.length; i++) kinds[i] = Math.round((rgba[i * 4 + 3] / 255) * 10);
+      this.matL0 = kinds;
+    }
+    matRead.unmap();
+    matRead.destroy();
 
     // 描画用: 光・材質テクスチャ ＋ 稲インスタンス（read-only）。生成 compute 用は別レイアウト（read_write）
     const layout = device.createBindGroupLayout({
@@ -1621,6 +1655,16 @@ export class WorldScene implements SceneRenderer {
     return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
   };
 
+  /** その地点が水（田の泥）か。焼いた材質を読む（world.wgsl の KIND_MUD = 1） */
+  isWater = (x: number, z: number): boolean => {
+    const l = this.l0, k = this.matL0;
+    if (!l || !k) return false;
+    const ix = Math.round((x - l.origin[0]) / l.texel - 0.5);
+    const iz = Math.round((z - l.origin[1]) / l.texel - 0.5);
+    if (ix < 0 || iz < 0 || ix >= l.size || iz >= l.size) return false;
+    return k[iz * l.size + ix] === 1;
+  };
+
   /** 変形の場を世界座標で読み戻す（検証用）。現在の ping 側を読む */
   async probeDeform(points: [number, number][]): Promise<typeof this.probeResults> {
     const device = this.device;
@@ -1737,8 +1781,22 @@ export class WorldScene implements SceneRenderer {
         // 体が通った跡（倒すだけ）
         this.addStamp(this.walker.x, this.walker.z, 0.42, 1, f.dirX, f.dirZ, 0, 0.85);
       }
-      const cam = this.walker.camera(this.groundHeight);
+      const cam = this.walker.camera(this.groundHeight, this.view.camDist);
       this.camera = { eye: cam.eye, forward: cam.forward };
+      // 人物: 歩き手の位置・向き・進んだ距離から姿勢を組む
+      this.figure.step({
+        x: this.walker.x, z: this.walker.z,
+        yawDeg: this.walker.yawDeg, pitchDeg: this.walker.pitchDeg,
+        moved: this.walker.lastMoved, running: this.walker.lastRunning, dt: FIXED_DT,
+        groundHeight: this.groundHeight, isWater: this.isWater,
+      });
+      const fm = this.figure.meshData();
+      this.figureVerts = Math.min(fm.length / VERTEX_FLOATS, WorldScene.FIGURE_MAX_VERTS);
+      this.device.queue.writeBuffer(this.figureMesh, 0, fm, 0, this.figureVerts * VERTEX_FLOATS);
+      this.device.queue.writeBuffer(this.figureInst, 0, new Float32Array([
+        this.walker.x, this.groundHeight(this.walker.x, this.walker.z), this.walker.z, 1.0,
+        0, 0, 0, 0,
+      ]));
     }
     // 変形の場を進めてから、フレーム定数（時刻・窓の原点）を書く
     this.stepDeform(encoder);
@@ -1826,6 +1884,12 @@ export class WorldScene implements SceneRenderer {
       scene.setVertexBuffer(0, d.mesh);
       scene.setVertexBuffer(1, d.instances);
       scene.draw(d.vertexCount, d.instanceCount);
+    }
+    // 人物（1 体）。毎フレーム組み直したメッシュを同じパイプラインで描く
+    if (this.figureVerts > 0) {
+      scene.setVertexBuffer(0, this.figureMesh);
+      scene.setVertexBuffer(1, this.figureInst);
+      scene.draw(this.figureVerts, 1);
     }
     scene.end();
 
@@ -1920,6 +1984,7 @@ export class WorldScene implements SceneRenderer {
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },
+      figure: { vertices: this.figureVerts, ...this.figure.stats },
       footfalls: this.footfallLog,
       resolution: { ...resolution, msaa: MSAA_SAMPLES },
       ring: {
