@@ -23,6 +23,10 @@ import treeWgsl from '../shaders/tree.wgsl?raw';
 import deformWgsl from '../shaders/deform.wgsl?raw';
 import deformUpdateWgsl from '../shaders/deform-update.wgsl?raw';
 import deformQueryWgsl from '../shaders/deform-query.wgsl?raw';
+import postWgsl from '../shaders/post.wgsl?raw';
+import detailWgsl from '../shaders/detail.wgsl?raw';
+import detailBakeWgsl from '../shaders/detail-bake.wgsl?raw';
+import detailSampleWgsl from '../shaders/detail-sample.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
@@ -46,7 +50,13 @@ const RING_COUNT = Math.ceil(Math.log(RING_RMAX / RING_R0) / Math.log(RING_K)) +
 const NEAR = 0.05;
 const SUN_ANGULAR_RADIUS_DEG = 0.27;
 
-const FRAME_FLOATS = 56;
+const FRAME_FLOATS = 60;
+/** 仕上げ: にじみの強さ・暗部の持ち上げ */
+const BLOOM_STRENGTH = 0.24;
+const SHADOW_LIFT = 0.028;
+/** 地面の細部タイル: 512² × 5 層（材質別）、8m 周期 */
+const DETAIL_TILE = 512;
+const DETAIL_LAYERS = 5;
 /** 変形の場: 1024² × 0.1m = 102.4m 四方をカメラ周りにトーラス状（wrap）に持つ。窓の外に出た変形は失われる */
 const DEFORM_SIZE = 1024;
 const DEFORM_TEXEL = 0.1;
@@ -145,11 +155,20 @@ export class WorldScene implements SceneRenderer {
   private tonemapPipeline!: GPURenderPipeline;
   private frameBindGroup!: GPUBindGroup;
   private tonemapBindGroup!: GPUBindGroup;
+  private bloomA!: GPUTexture;
+  private bloomB!: GPUTexture;
+  private bloomDownPipeline!: GPUComputePipeline;
+  private bloomBlurH!: GPUComputePipeline;
+  private bloomBlurV!: GPUComputePipeline;
+  private bloomBindGroups: GPUBindGroup[] = [];
+  private bloomSize = { w: 1, h: 1 };
   private indexBuffer!: GPUBuffer;
   private indexCount = 0;
   private heightTex!: GPUTexture;
   private heightBindGroup!: GPUBindGroup;
   private heightBakeMs = 0;
+  private detailTex!: GPUTexture;
+  private detailBakeMs = 0;
   private skyLutTex!: GPUTexture;
   private skyLutPipeline!: GPUComputePipeline;
   private skyLutBakeBindGroup!: GPUBindGroup;
@@ -266,7 +285,7 @@ export class WorldScene implements SceneRenderer {
     this.queryModule = queryModule;
     const terrainModule = await this.makeModule(
       'terrain',
-      worldCode + frameWgsl + heightsampleWgsl + atmosphereWgsl + skylutWgsl + windWgsl + deformWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
+      worldCode + frameWgsl + heightsampleWgsl + detailWgsl + detailSampleWgsl + atmosphereWgsl + skylutWgsl + windWgsl + deformWgsl + shadowWgsl + lightsampleWgsl + terrainWgsl,
     );
     const heightmapModule = await this.makeModule('heightmap', worldCode + frameWgsl + heightsampleWgsl + shadowWgsl + heightmapWgsl);
     const skyModule = await this.makeModule('sky', commonWgsl + noiseWgsl + frameWgsl + atmosphereWgsl + skylutWgsl + windWgsl + skyWgsl);
@@ -287,6 +306,7 @@ export class WorldScene implements SceneRenderer {
     this.resolved.eyeGroundHeight = eyeGround;
 
     // --- 高さテクスチャを焼く（リング中心 = 視点 xz） ---
+    await this.bakeDetailTiles(worldCode);
     const fwd = dirFromAzEl(this.view.yawDeg, 0);
     const heightLayout = await this.bakeHeightmaps(heightmapModule, eyeXZ, [fwd[0] * 100, fwd[2] * 100]);
 
@@ -721,11 +741,45 @@ export class WorldScene implements SceneRenderer {
       multisample: { count: MSAA_SAMPLES },
     });
 
+    // --- 光のにじみ（bloom）: 1/4 解像度で 3 パス ---
+    // 1/8 解像度。1/4 だと 1.2ms 掛かる（実測）。ぼかしの広がりは歩幅で合わせる
+    this.bloomSize = { w: Math.max(1, Math.floor(WIDTH / 8)), h: Math.max(1, Math.floor(HEIGHT / 8)) };
+    const bloomDesc: GPUTextureDescriptor = {
+      size: [this.bloomSize.w, this.bloomSize.h],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    };
+    this.bloomA = device.createTexture(bloomDesc);
+    this.bloomB = device.createTexture(bloomDesc);
+    const postLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+      ],
+    });
+    const postModule = await this.makeModule('post', commonWgsl + noiseWgsl + frameWgsl + postWgsl);
+    const postPL = device.createPipelineLayout({ bindGroupLayouts: [frameLayout, postLayout] });
+    this.bloomDownPipeline = device.createComputePipeline({ label: 'bloomDown', layout: postPL, compute: { module: postModule, entryPoint: 'bloomDown' } });
+    this.bloomBlurH = device.createComputePipeline({ label: 'bloomBlurH', layout: postPL, compute: { module: postModule, entryPoint: 'bloomBlurH' } });
+    this.bloomBlurV = device.createComputePipeline({ label: 'bloomBlurV', layout: postPL, compute: { module: postModule, entryPoint: 'bloomBlurV' } });
+    const postSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+    const mkPost = (src: GPUTexture, dst: GPUTexture): GPUBindGroup => device.createBindGroup({
+      layout: postLayout,
+      entries: [
+        { binding: 0, resource: src.createView() },
+        { binding: 1, resource: dst.createView() },
+        { binding: 2, resource: postSampler },
+      ],
+    });
+    this.bloomBindGroups = [mkPost(this.hdr, this.bloomA), mkPost(this.bloomA, this.bloomB), mkPost(this.bloomB, this.bloomA)];
+
     const tonemapLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
       ],
     });
     this.tonemapPipeline = device.createRenderPipeline({
@@ -741,6 +795,7 @@ export class WorldScene implements SceneRenderer {
         { binding: 0, resource: { buffer: this.frameBuffer } },
         { binding: 1, resource: this.hdr.createView() },
         { binding: 2, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
+        { binding: 3, resource: this.bloomA.createView() },
       ],
     });
 
@@ -847,6 +902,7 @@ export class WorldScene implements SceneRenderer {
         { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       ],
     });
     this.heightBindGroup = device.createBindGroup({
@@ -854,10 +910,57 @@ export class WorldScene implements SceneRenderer {
       entries: [
         { binding: 0, resource: { buffer: levelsBuf } },
         { binding: 1, resource: this.heightTex.createView({ dimension: '2d-array' }) },
-        { binding: 2, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }) },
+        { binding: 2, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' }) },
+        { binding: 3, resource: this.detailTex.createView({ dimension: '2d-array' }) },
       ],
     });
     return layout;
+  }
+
+  /** 地面の細部の凹凸を材質別のタイルに焼く（起動時 1 回、8m 周期） */
+  private async bakeDetailTiles(worldCode: string): Promise<void> {
+    const device = this.device;
+    const t0 = performance.now();
+    this.detailTex = device.createTexture({
+      size: [DETAIL_TILE, DETAIL_TILE, DETAIL_LAYERS],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const module = await this.makeModule('detailBake', worldCode + detailWgsl + detailBakeWgsl);
+    const layout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { format: 'rgba16float', access: 'write-only', viewDimension: '2d-array' } },
+      ],
+    });
+    const pipeline = device.createComputePipeline({
+      label: 'bakeDetail',
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      compute: { module, entryPoint: 'bakeDetail' },
+    });
+    const encoder = device.createCommandEncoder();
+    const scratch: GPUBuffer[] = [];
+    for (let i = 0; i < DETAIL_LAYERS; i++) {
+      const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buf, 0, new Uint32Array([i, 0, 0, 0]));
+      scratch.push(buf);
+      const bg = device.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: { buffer: buf } },
+          { binding: 1, resource: this.detailTex.createView({ dimension: '2d-array' }) },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(DETAIL_TILE / 8, DETAIL_TILE / 8);
+      pass.end();
+    }
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    for (const b of scratch) b.destroy();
+    this.detailBakeMs = performance.now() - t0;
   }
 
   /** 焼いた高さから法線と日向/日陰を段ごとに焼く。画素側は 1 タップで読む */
@@ -1229,6 +1332,7 @@ export class WorldScene implements SceneRenderer {
       WIND_TEXEL, WIND_SIZE,
     ], 48);
     f.set([this.deformOrigin[0], this.deformOrigin[1], DEFORM_TEXEL, DEFORM_SIZE], 52);
+    f.set([BLOOM_STRENGTH, SHADOW_LIFT, 0, 0], 56);
     this.device.queue.writeBuffer(this.frameBuffer, 0, f);
   }
 
@@ -1460,6 +1564,27 @@ export class WorldScene implements SceneRenderer {
     sky.draw(3);
     sky.end();
 
+    // 2b. 光のにじみ（1/4 解像度で 抽出 → 横ぼかし → 縦ぼかし）
+    {
+      const gx = Math.ceil(this.bloomSize.w / 8);
+      const gy = Math.ceil(this.bloomSize.h / 8);
+      const pass = encoder.beginComputePass();
+      pass.setBindGroup(0, this.frameBindGroup);
+      pass.setPipeline(this.bloomDownPipeline);
+      pass.setBindGroup(1, this.bloomBindGroups[0]);
+      pass.dispatchWorkgroups(gx, gy);
+      // 横→縦を 2 往復して広げる（A→B→A→B→A、最後は A に入る）
+      for (let i = 0; i < 2; i++) {
+        pass.setPipeline(this.bloomBlurH);
+        pass.setBindGroup(1, this.bloomBindGroups[1]);
+        pass.dispatchWorkgroups(gx, gy);
+        pass.setPipeline(this.bloomBlurV);
+        pass.setBindGroup(1, this.bloomBindGroups[2]);
+        pass.dispatchWorkgroups(gx, gy);
+      }
+      pass.end();
+    }
+
     // 3. 露出とトーンマップ → キャンバス
     const tonemap = encoder.beginRenderPass({
       colorAttachments: [{ view: ctx.target, loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: 'store' }],
@@ -1504,7 +1629,7 @@ export class WorldScene implements SceneRenderer {
     return {
       view: this.view,
       resolved: this.resolved,
-      heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs },
+      heightmap: { size: HM_SIZE, texels: HM_TEXELS, format: 'r32float', bakeMs: this.heightBakeMs, normalShadowBakeMs: this.lightBakeMs, detailBakeMs: this.detailBakeMs },
       water: this.waterStats,
       rice: { ...this.riceCounts, max: RICE_MAX, nearVerts: RICE_NEAR_VERTS, midVerts: RICE_MID_VERTS },
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },

@@ -13,7 +13,7 @@ struct RiceInstance {
 };
 const RICE_ROW: f32 = 0.30;      // 条間 [m]
 const RICE_HILL: f32 = 0.22;     // 株間 [m]
-const RICE_NEAR_R: f32 = 40.0;   // 株で描く距離
+const RICE_NEAR_R: f32 = 31.0;   // 株で描く距離。地面すれすれの視点で 60fps を保つため詰めた（40 → 34）
 const RICE_MID_R: f32 = 150.0;   // 束で描く距離
 const RICE_MID_STEP: f32 = 0.9;  // 束の間隔（3×3 株）
 const RICE_HEIGHT: f32 = 0.46;

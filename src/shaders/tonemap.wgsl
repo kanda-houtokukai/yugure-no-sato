@@ -3,6 +3,7 @@
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var hdr: texture_2d<f32>;
 @group(0) @binding(2) var hdrSamp: sampler;
+@group(0) @binding(3) var bloomTex: texture_2d<f32>;
 
 struct VSOut { @builtin(position) pos: vec4f };
 
@@ -19,10 +20,25 @@ fn acesFitted(x: vec3f) -> vec3f {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
 }
 
-/** 露出→トーンマップ→ガンマ。FXAA はこの結果（表示値）で判断する */
+/**
+ * 露出 → にじみの加算 → トーンマップ → 暗部の持ち上げ → 色調 → ガンマ。
+ * FXAA はこの結果（表示値）で判断する。
+ */
 fn display(uv: vec2f) -> vec3f {
   let c = textureSampleLevel(hdr, hdrSamp, uv, 0.0).rgb;
-  return pow(acesFitted(c * frame.params.y), vec3f(1.0 / 2.2));
+  var e = c * frame.params.y;
+  // 夕日まわりの光のにじみ（1/4 解像度のぼかしを加算）
+  e += textureSampleLevel(bloomTex, hdrSamp, uv, 0.0).rgb * frame.post.x;
+  var m = acesFitted(e);
+  // 暗部を潰さない: 影の中の階調を持ち上げる（暗いところほど効く）
+  let lift = frame.post.y;
+  m = m + lift * (1.0 - m) * (1.0 - m) * (1.0 - m);
+  // 色調の統一: 夕方の暖色へわずかに寄せ、影は青に振る
+  let lum = dot(m, vec3f(0.299, 0.587, 0.114));
+  let warm = vec3f(1.045, 1.000, 0.945);
+  let cool = vec3f(0.955, 0.985, 1.070);
+  m = m * mix(cool, warm, smoothstep(0.12, 0.72, lum));
+  return pow(clamp(m, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
 }
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 
@@ -33,6 +49,11 @@ fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4f {
   let res = frame.center.zw;
+  // 診断用 dbg=19: にじみのテクスチャそのものを見る
+  if (frame.params.w == 19.0) {
+    let b = textureSampleLevel(bloomTex, hdrSamp, in.pos.xy / res, 0.0).rgb;
+    return vec4f(pow(clamp(b, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
+  }
   let px = 1.0 / res;
   let uv = in.pos.xy * px;
   let rgbM = display(uv);

@@ -43,30 +43,6 @@ struct FSOut {
   @location(0) color: vec4f,
 };
 
-/**
- * 地面の細かい凹凸。高さテクスチャは 0.25m テクセルなので、それより細かい起伏は法線で足す。
- * 高さそのものは変えない（変形の場や当たり判定と食い違わせないため）。近距離でのみ効かせる。
- */
-fn detailBump(p: vec2f, kind: u32) -> f32 {
-  switch (kind) {
-    // 太陽が仰角 3.5° と低いので、わずかな傾きが大きな明暗になる。振幅は控えめに
-    case 3u, 7u: {   // 土の道・集落の敷地: 踏み固めた土の細かい凹凸
-      return 0.0035 * gnoise(p * 6.0, 701u) + 0.0016 * gnoise(p * 17.0, 702u);
-    }
-    case 1u: {       // 田の泥: 濡れた泥のうねり（粗く、なだらか）
-      return 0.0030 * gnoise(p * 4.5, 703u);
-    }
-    case 8u: {       // 境内: 玉砂利の粒
-      return 0.0014 * gnoise(p * 24.0, 704u) + 0.0009 * gnoise(p * 55.0, 705u);
-    }
-    case 4u: {       // 川床: 石まじり
-      return 0.0040 * gnoise(p * 8.0, 706u);
-    }
-    default: {       // 草地・畦・丘: 株の根元の起伏
-      return 0.0050 * gnoise(p * 3.5, 707u) + 0.0024 * gnoise(p * 11.0, 708u);
-    }
-  }
-}
 
 @fragment
 fn fs(in: VSOut) -> FSOut {
@@ -89,14 +65,11 @@ fn fs(in: VSOut) -> FSOut {
   // 変形の沈みで法線も傾ける（高さだけ変えると、へこんでいるのに陰影が平らなまま）
   let sg = deformSinkGradient(p);
   n = normalize(vec3f(n.x + sg.x * n.y, n.y, n.z + sg.y * n.y));
-  // 細部の凹凸で法線を傾ける（近距離のみ。遠くでは画素より細かくなりエイリアスになる）
+  // 細部の凹凸で法線を傾ける（焼いたタイルを 1 タップ。近距離のみ＝遠くでは画素より細かくなる）
   let detailFade = 1.0 - smootherstep(7.0, 28.0, dist);
   if (detailFade > 0.0 && dbg != 17.0) {   // 計測用 dbg=17: 細部の凹凸なし
-    let e = max(0.035, pixelSize);
-    let b0 = detailBump(p, baked.kind);
-    let bx = detailBump(p + vec2f(e, 0.0), baked.kind);
-    let bz = detailBump(p + vec2f(0.0, e), baked.kind);
-    n = normalize(n + vec3f((b0 - bx) / e, 0.0, (b0 - bz) / e) * detailFade);
+    let g = detailGradient(p, baked.kind);
+    n = normalize(n + vec3f(g.x, 0.0, g.y) * detailFade);
   }
 
   let df = deformAt(p);
