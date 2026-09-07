@@ -393,3 +393,221 @@ export const STOREHOUSE_DEFAULT: FarmhouseParams = {
   floorHeight: 0.42, veranda: 0, lean: 0,
   style: 'storehouse', roof: 'tile',
 };
+
+// ============ 神社 ============
+
+/**
+ * 明神鳥居。笠木が反り、島木・貫・額束を持つ。柱は上でわずかに内へ倒す（転び）。
+ * 原点は地面の中心、参道は Z 方向（+Z が手前）。
+ */
+export function buildTorii(seed: number, height: number, span: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const pr = height * 0.052;              // 柱の半径
+  const lean = height * 0.018;            // 転び（上で内へ）
+  const nukiY = height * 0.62;            // 貫の高さ
+  const shimaY = height * 0.93;           // 島木の下端
+  const hs = span / 2;
+
+  for (const sx of [1, -1]) {
+    m.tube([sx * hs, 0, 0], [sx * (hs - lean), height, 0], pr * 1.12, pr * 0.94, 12, MAT_POST);
+    // 亀腹（柱の根元の石）
+    m.tube([sx * hs, 0, 0], [sx * hs, 0.26, 0], pr * 1.55, pr * 1.32, 12, MAT_STONE);
+  }
+  // 貫（柱を貫いて外へ出る）
+  m.box([0, nukiY, 0], [span + pr * 3.4, height * 0.052, pr * 1.5], MAT_POST);
+  // 島木（笠木の下の直線材）。柱より外へ張り出す
+  const outw = span + height * 0.30;
+  m.box([0, shimaY, 0], [outw, height * 0.055, pr * 2.3], MAT_POST);
+  // 笠木（両端が反り上がる）。分割して曲げる
+  const N = 14;
+  const kh = height * 0.062;
+  const rise = height * 0.075;
+  const kasagi = (t: number): number => shimaY + height * 0.058 + rise * (t * t);   // t = -1..1
+  for (let i = 0; i < N; i++) {
+    const t0 = -1 + (2 * i) / N, t1 = -1 + (2 * (i + 1)) / N;
+    const x0 = (t0 * outw) / 2 * 1.06, x1 = (t1 * outw) / 2 * 1.06;
+    const y0 = kasagi(t0), y1 = kasagi(t1);
+    const w = pr * 2.7;
+    // 上面・前後面・下面の 4 枚で角材を曲げる
+    m.quad([x0, y0 + kh, -w], [x1, y1 + kh, -w], [x1, y1 + kh, w], [x0, y0 + kh, w], MAT_POST, 0, undefined, [0, 1, 0]);
+    m.quad([x0, y0, w], [x1, y1, w], [x1, y1 + kh, w], [x0, y0 + kh, w], MAT_POST, 0, undefined, [0, 0, 1]);
+    m.quad([x1, y1, -w], [x0, y0, -w], [x0, y0 + kh, -w], [x1, y1 + kh, -w], MAT_POST, 0, undefined, [0, 0, -1]);
+    m.quad([x1, y1, w], [x0, y0, w], [x0, y0, -w], [x1, y1, -w], MAT_POST, 0, undefined, [0, -1, 0]);
+  }
+  // 額束（貫と島木の間の短い柱）
+  m.box([0, (nukiY + shimaY) / 2, 0], [height * 0.055, shimaY - nukiY, pr * 1.2], MAT_POST);
+  void r;
+  return finish(m);
+}
+
+/**
+ * 小さな村の社殿。高床・板壁・切妻の妻入・階段と縁・千木と鰹木。
+ * 原点は地面の中心、+Z が正面（階段のある側）。
+ */
+export function buildShrine(seed: number, scale: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const W = 3.6 * scale, D = 3.2 * scale;
+  const hw = W / 2, hd = D / 2;
+  const fl = 1.15 * scale;        // 高床
+  const eh = fl + 2.15 * scale;   // 軒
+  const rh = fl + 3.5 * scale;    // 棟
+  const eo = 0.75 * scale;        // 軒の出
+  const go = 0.55 * scale;
+
+  // 束石と床束
+  for (const x of [-hw + 0.3, 0, hw - 0.3]) {
+    for (const z of [-hd + 0.3, hd - 0.3]) {
+      m.box([x, 0.14, z], [0.34, 0.28, 0.34], MAT_STONE);
+      m.box([x, (fl + 0.28) / 2, z], [0.16, fl - 0.28, 0.16], MAT_POST);
+    }
+  }
+  // 床と縁（周囲に回る）
+  m.box([0, fl - 0.06, 0], [W + 0.7, 0.12, D + 0.7], MAT_DECK);
+  // 高欄（縁の手すり）
+  for (const sz of [1, -1]) {
+    m.box([0, fl + 0.34, sz * (hd + 0.33)], [W + 0.7, 0.07, 0.07], MAT_POST);
+    for (let i = 0; i <= 4; i++) {
+      const x = -(W + 0.5) / 2 + ((W + 0.5) * i) / 4;
+      m.box([x, fl + 0.17, sz * (hd + 0.33)], [0.06, 0.34, 0.06], MAT_POST);
+    }
+  }
+  // 壁（板張り）と柱
+  m.box([0, (fl + eh) / 2, 0], [W, eh - fl, D], MAT_PLANK);
+  for (const sx of [1, -1]) for (const sz of [1, -1]) {
+    m.box([sx * hw, (fl + eh) / 2, sz * hd], [0.15, eh - fl, 0.15], MAT_POST);
+  }
+  // 扉（正面）
+  m.box([0, fl + (eh - fl) * 0.47, hd - 0.02], [W * 0.42, (eh - fl) * 0.78, 0.08], MAT_POST);
+  // 屋根（切妻・妻入: 棟は Z 方向に走る）
+  const rwz = hd + go;   // 棟の長さ方向の半分
+  const rex = hw + eo;   // 軒先の X
+  const th = 0.14;
+  for (const s of [1, -1]) {
+    const ridge0: V3 = [0, rh, -rwz];
+    const ridge1: V3 = [0, rh, rwz];
+    const eave0: V3 = [s * rex, eh, -rwz];
+    const eave1: V3 = [s * rex, eh, rwz];
+    const run = Math.hypot(rex, rh - eh);
+    const uv: [number, number][] = [[0, 0], [2 * rwz, 0], [2 * rwz, run], [0, run]];
+    if (s > 0) m.quad(ridge0, ridge1, eave1, eave0, MAT_PLANK, 0, uv);
+    else m.quad(eave0, eave1, ridge1, ridge0, MAT_PLANK, 0, uv);
+    const d: V3 = [0, -th, 0];
+    const r0: V3 = [ridge0[0] + d[0], ridge0[1] + d[1], ridge0[2]];
+    const r1: V3 = [ridge1[0], ridge1[1] - th, ridge1[2]];
+    const e0: V3 = [eave0[0], eave0[1] - th, eave0[2]];
+    const e1: V3 = [eave1[0], eave1[1] - th, eave1[2]];
+    if (s > 0) m.quad(e0, e1, r1, r0, MAT_POST, 0, undefined, [0, -1, 0]);
+    else m.quad(r0, r1, e1, e0, MAT_POST, 0, undefined, [0, -1, 0]);
+    // 軒先の小口
+    if (s > 0) m.quad(e0, e1, eave1, eave0, MAT_PLANK, 0, undefined, [s, -0.3, 0]);
+    else m.quad(eave1, e1, e0, eave0, MAT_PLANK, 0, undefined, [s, -0.3, 0]);
+  }
+  // 鰹木（棟に横たわる丸太 3 本）
+  for (let i = 0; i < 3; i++) {
+    const z = -rwz * 0.55 + (rwz * 1.1 * i) / 2;
+    m.tube([-0.42 * scale, rh + 0.14 * scale, z], [0.42 * scale, rh + 0.14 * scale, z], 0.115 * scale, 0.115 * scale, 8, MAT_POST);
+  }
+  // 千木（棟の両端で X 字に交差する板）
+  for (const sz of [1, -1]) {
+    for (const sx of [1, -1]) {
+      const base: V3 = [sx * 0.16 * scale, rh - 0.35 * scale, sz * (rwz - 0.12 * scale)];
+      const tip: V3 = [sx * 0.62 * scale, rh + 1.05 * scale, sz * (rwz + 0.20 * scale)];
+      m.tube(base, tip, 0.075 * scale, 0.055 * scale, 4, MAT_POST);
+    }
+  }
+  // 正面の階段
+  const steps = 5;
+  for (let i = 0; i < steps; i++) {
+    const y = (fl * (i + 1)) / steps;
+    const z = hd + 0.45 + i * 0.30;
+    m.box([0, y - fl / steps / 2, z], [W * 0.55, fl / steps, 0.34], MAT_POST);
+  }
+  void r;
+  return finish(m);
+}
+
+/** 石灯籠。基礎・竿・中台・火袋・笠・宝珠 */
+export function buildLantern(seed: number, h: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  const s = h / 2.2;
+  m.tube([0, 0, 0], [0, 0.26 * s, 0], 0.34 * s, 0.30 * s, 8, MAT_STONE);          // 基礎
+  m.tube([0, 0.26 * s, 0], [0, 1.10 * s, 0], 0.14 * s, 0.125 * s, 8, MAT_STONE);  // 竿
+  m.tube([0, 1.10 * s, 0], [0, 1.30 * s, 0], 0.30 * s, 0.26 * s, 8, MAT_STONE);   // 中台
+  // 火袋（六角の箱。開口があるので柱と面で作る）
+  for (let i = 0; i < 6; i++) {
+    const a0 = (i / 6) * Math.PI * 2, a1 = ((i + 1) / 6) * Math.PI * 2;
+    const rr = 0.24 * s;
+    const p0: V3 = [Math.cos(a0) * rr, 1.30 * s, Math.sin(a0) * rr];
+    const p1: V3 = [Math.cos(a1) * rr, 1.30 * s, Math.sin(a1) * rr];
+    if (i % 2 === 0) {
+      m.quad(p0, p1, [p1[0], 1.72 * s, p1[2]], [p0[0], 1.72 * s, p0[2]], MAT_STONE);
+    } else {
+      m.tube(p0, [p0[0], 1.72 * s, p0[2]], 0.045 * s, 0.045 * s, 5, MAT_STONE);
+    }
+  }
+  m.tube([0, 1.72 * s, 0], [0, 1.98 * s, 0], 0.46 * s, 0.20 * s, 8, MAT_STONE);   // 笠
+  m.tube([0, 1.98 * s, 0], [0, 2.20 * s, 0], 0.10 * s, 0.02 * s, 6, MAT_STONE);   // 宝珠
+  void r;
+  return finish(m);
+}
+
+/**
+ * 石段。境内の縁の斜面を上がる。段の一枚ずつに厚みと不揃いがある。
+ * 原点は下端の中心、+Z へ上がる。
+ */
+export function buildStairs(seed: number, steps: number, width: number, rise: number, run: number): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  for (let i = 0; i < steps; i++) {
+    const y = i * rise;
+    const z = i * run;
+    const w = width * (0.94 + 0.12 * r());
+    // 段は下へ深く伸ばす。地形は S 字に曲がるので、薄いと中間で埋もれる（実測）
+    const t = rise * (2.2 + 0.6 * r());
+    const skew = (r() - 0.5) * 0.06;
+    m.box([skew, y + rise * 0.5 - t / 2 + rise * 0.5, z + run / 2], [w, t, run * (1.0 + 0.14 * r())], MAT_STONE);
+    // 両脇の縁石
+    for (const sx of [1, -1]) {
+      m.box([sx * (w / 2 + 0.16), y + rise * 0.5 - t * 0.25, z + run / 2], [0.32 + 0.1 * r(), t * 1.5, run * 0.95], MAT_STONE);
+    }
+  }
+  return finish(m);
+}
+
+/**
+ * 野面積みの石垣。自然石を不揃いに積む。
+ * 原点は中央下端、X 方向に長さ len、高さ h。規則的な格子に見えないよう
+ * 段ごとに石の幅・高さ・出入りを変え、目地に隙間を残す。
+ */
+export function buildStoneWall(seed: number, len: number, h: number, depth = 0.55): Float32Array {
+  const r = rng(seed);
+  const m = new MeshBuilder();
+  let y = 0;
+  let course = 0;
+  while (y < h - 0.05) {
+    // 段の高さは 0.22〜0.46m でばらす
+    const ch = Math.min(0.22 + 0.24 * r(), h - y);
+    // 段ごとに開始位置をずらす（縦目地を通さない）
+    let x = -len / 2 - r() * 0.4;
+    while (x < len / 2) {
+      const cw = 0.30 + 0.55 * r() * (1 + 0.3 * Math.sin(course * 1.7));
+      const w = Math.min(cw, len / 2 - x);
+      if (w < 0.12) break;
+      // 石ごとに高さ・奥行き・傾きを変える。目地に隙間を残すため 0.03〜0.06 縮める
+      const gap = 0.03 + 0.03 * r();
+      const sh = ch * (0.82 + 0.16 * r());
+      const sd = depth * (0.8 + 0.35 * r());
+      const tilt = (r() - 0.5) * 0.10;
+      // 石は上に行くほどわずかに内へ（勾配）
+      const batter = 0.10 * (y / Math.max(h, 0.001));
+      m.box([x + w / 2, y + sh / 2 + tilt * 0.05, -batter], [w - gap, sh - gap * 0.7, sd], MAT_STONE);
+      x += w;
+    }
+    y += ch;
+    course++;
+  }
+  return finish(m);
+}

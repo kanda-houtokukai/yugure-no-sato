@@ -36,7 +36,7 @@ fn materialKind(p: vec2f) -> u32 {
   let lv = hmLevels.l[li];
   let uv = (p - lv.xy) / (lv.z * lv.w);
   let m = textureSampleLevel(updMat, hmSamp, uv, li, 0.0);
-  return u32(round(m.a * 8.0));
+  return u32(round(m.a * 10.0));
 }
 
 /** 素材ごとの戻り方: x = 沈みの時定数 [s], y = 倒れの時定数 [s], z = 沈める最大深さ [m] */

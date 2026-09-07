@@ -30,7 +30,11 @@ import detailSampleWgsl from '../shaders/detail-sample.wgsl?raw';
 import buildingWgsl from '../shaders/building.wgsl?raw';
 import { TREE_VERTEX_FLOATS, buildTreeVariants, planTrees } from './trees';
 import { VERTEX_FLOATS } from './mesh';
-import { BARN_DEFAULT, FARMHOUSE_DEFAULT, STOREHOUSE_DEFAULT, buildFarmhouse, type FarmhouseParams } from './buildings';
+import {
+  BARN_DEFAULT, FARMHOUSE_DEFAULT, STOREHOUSE_DEFAULT,
+  buildFarmhouse, buildLantern, buildShrine, buildStoneWall, buildTorii,
+  type FarmhouseParams,
+} from './buildings';
 import { IDLE_INPUT, Walker, scriptInput, type WalkerInput } from './walker';
 
 import type { DeviceBundle } from '../gpu/device';
@@ -214,6 +218,7 @@ export class WorldScene implements SceneRenderer {
   private buildingPipeline!: GPURenderPipeline;
   private buildingDraws: { mesh: GPUBuffer; vertexCount: number; instances: GPUBuffer; instanceCount: number; name: string }[] = [];
   private buildingStats = { total: 0, kinds: [] as { name: string; vertices: number; instances: number }[] };
+  private stairInfo = { rise: 0, run: 0, steps: 0, slopeDeg: 0 };
 
   // ---- 変形の場 ----
   private deformTex: GPUTexture[] = [];
@@ -1282,19 +1287,51 @@ export class WorldScene implements SceneRenderer {
     // 道の西側（u<0）の家は東（+X）を向く（θ=-90°）、東側（u>0）の家は西（-X）を向く（θ=+90°）。
     // 整列させないよう、向きを ±10° 振る。茅葺きは主道から見える中心に置く（[DECISION]）
     const deg = (d: number): number => (d * Math.PI) / 180;
-    const plan: { kind: 'thatch' | 'house' | 'barn' | 'storehouse'; u: number; v: number; rot: number; scale: number }[] = [
+    const plan: { kind: string; u: number; v: number; rot: number; scale: number; lift?: number }[] = [
       { kind: 'thatch', u: -14, v: -129, rot: deg(-84), scale: 1.0 },   // 主道の西、集落の中心
       { kind: 'house', u: 14, v: -136, rot: deg(86), scale: 0.95 },
       { kind: 'house', u: -16, v: -147, rot: deg(-98), scale: 0.88 },
       { kind: 'barn', u: 13, v: -122, rot: deg(66), scale: 1.0 },
       { kind: 'barn', u: 24, v: -147, rot: deg(108), scale: 0.92 },
       { kind: 'storehouse', u: -27, v: -136, rot: deg(-64), scale: 1.0 },
+      // 神社（境内は谷座標 中心 (0,270)・半幅 34×24、縁 8m の斜面を石段が上がる）
+      { kind: 'torii', u: 0, v: 196, rot: 0, scale: 1.0 },        // 参道の入口
+      { kind: 'torii', u: 0, v: 252, rot: 0, scale: 0.86 },       // 石段を上がった境内の手前
+      { kind: 'shrine', u: 0, v: 279, rot: deg(180), scale: 1.0 },// 社殿（南＝参道を向く）
+      { kind: 'lantern', u: -3.6, v: 233, rot: 0, scale: 1.0 },
+      { kind: 'lantern', u: 3.6, v: 233, rot: 0, scale: 1.0 },
+      { kind: 'lantern', u: -4.0, v: 258, rot: 0, scale: 1.0 },
+      { kind: 'lantern', u: 4.0, v: 258, rot: 0, scale: 1.0 },
+      { kind: 'lantern', u: -4.4, v: 270, rot: 0, scale: 1.0 },
+      { kind: 'lantern', u: 4.4, v: 270, rot: 0, scale: 1.0 },
+      // 石垣: 境内の縁（石段の両脇）と、集落の敷地の道に面した縁、田の一部
+      { kind: 'wall14', u: -12, v: 254, rot: deg(94), scale: 1.0 },
+      { kind: 'wall14', u: 12, v: 254, rot: deg(86), scale: 1.0 },
+      { kind: 'wall10', u: -24, v: 262, rot: deg(72), scale: 1.0 },
+      { kind: 'wall10', u: 24, v: 262, rot: deg(108), scale: 1.0 },
+      { kind: 'wall10', u: -8.5, v: -118, rot: deg(90), scale: 1.0 },
+      { kind: 'wall10', u: 8.5, v: -152, rot: deg(90), scale: 1.0 },
+      { kind: 'wall10', u: -34, v: -128, rot: deg(20), scale: 1.0 },
+      { kind: 'wall14', u: 30, v: -112, rot: deg(8), scale: 1.0 },
     ];
-    const rz = new Float32Array(await this.runQuery('riverQuery', [
-      { binding: 6, data: new Float32Array(plan.map((b) => b.u)), type: 'read-only-storage' },
-    ], { binding: 7, byteLength: plan.length * 4 }, Math.ceil(plan.length / 64)));
-    const xz = plan.map((b, i) => [b.u, b.v + rz[i]] as [number, number]);
-    const heights = await this.queryHeights(this.queryModule, xz);
+    // 石段の勾配は地形から決める（決め打ちだと埋まるか浮く）。下端と上端の高さを正本に問い合わせる
+    const stairV0 = 240;
+    const stairV1 = 253;
+    const probeU = [...plan.map((b) => b.u), 0, 0];
+    const rzAll = new Float32Array(await this.runQuery('riverQuery', [
+      { binding: 6, data: new Float32Array(probeU), type: 'read-only-storage' },
+    ], { binding: 7, byteLength: probeU.length * 4 }, Math.ceil(probeU.length / 64)));
+    const xz = plan.map((b, i) => [b.u, b.v + rzAll[i]] as [number, number]);
+    const stairPts: [number, number][] = [
+      [0, stairV0 + rzAll[plan.length]],
+      [0, stairV1 + rzAll[plan.length + 1]],
+    ];
+    const allHeights = await this.queryHeights(this.queryModule, [...xz, ...stairPts]);
+    const heights = allHeights.slice(0, plan.length);
+    const stairRise = allHeights[plan.length + 1] - allHeights[plan.length];
+    const stairRun = stairV1 - stairV0;
+    const stairSteps = Math.max(6, Math.round(stairRise / 0.34));
+    this.stairInfo = { rise: stairRise, run: stairRun, steps: stairSteps, slopeDeg: (Math.atan2(stairRise, stairRun) * 180) / Math.PI };
 
     const thatchParams: FarmhouseParams = {
       ...FARMHOUSE_DEFAULT,
@@ -1309,6 +1346,11 @@ export class WorldScene implements SceneRenderer {
       house: buildFarmhouse(101, FARMHOUSE_DEFAULT),
       barn: buildFarmhouse(303, BARN_DEFAULT),
       storehouse: buildFarmhouse(404, STOREHOUSE_DEFAULT),
+      torii: buildTorii(505, 4.6, 3.9),
+      shrine: buildShrine(606, 1.15),
+      lantern: buildLantern(707, 1.9),
+      wall14: buildStoneWall(909, 14, 1.5),
+      wall10: buildStoneWall(910, 10, 1.1),
     };
     this.buildingDraws = [];
     const kindsStat: { name: string; vertices: number; instances: number }[] = [];
@@ -1317,7 +1359,7 @@ export class WorldScene implements SceneRenderer {
       if (mine.length === 0) continue;
       const inst = new Float32Array(mine.length * 8);
       mine.forEach((i, k) => {
-        inst.set([xz[i][0], heights[i], xz[i][1], plan[i].scale, plan[i].rot, 0, 0, 0], k * 8);
+        inst.set([xz[i][0], heights[i] + (plan[i].lift ?? 0), xz[i][1], plan[i].scale, plan[i].rot, 0, 0, 0], k * 8);
       });
       const meshBuf = device.createBuffer({ size: mesh.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(meshBuf, 0, mesh);
@@ -1740,6 +1782,7 @@ export class WorldScene implements SceneRenderer {
       grass: { ...this.grassCounts, max: GRASS_MAX, nearVerts: GRASS_NEAR_VERTS, midVerts: GRASS_MID_VERTS },
       trees: this.treeStats,
       buildings: this.buildingStats,
+      stairs: this.stairInfo,
       deform: { size: DEFORM_SIZE, texel: DEFORM_TEXEL, extentM: DEFORM_SIZE * DEFORM_TEXEL, fixedDt: FIXED_DT, origin: this.deformOrigin },
       probe: this.probeResults,
       walker: { x: this.walker.x, y: this.walker.y, z: this.walker.z, yawDeg: this.walker.yawDeg, camera: this.camera },

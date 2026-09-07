@@ -10,7 +10,7 @@ fn detailLayer(kind: u32) -> i32 {
     case 1u: { return 1; }              // 田の泥
     case 3u, 7u: { return 2; }          // 土の道・集落の敷地
     case 4u: { return 3; }              // 川床
-    case 6u, 8u: { return 4; }          // 山・境内
+    case 6u, 8u, 9u: { return 4; }      // 山・境内・石段
     default: { return 0; }              // 草地・畦・丘
   }
 }

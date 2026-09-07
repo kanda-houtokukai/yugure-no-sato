@@ -206,8 +206,8 @@ fn nearestPath(uv: vec2f, floorH: f32) -> PathHit {
   var best: PathHit;
   best.dist = 1e9; best.halfWidth = 1.1; best.top = floorH + 0.55; best.on = false;
 
-  // 主道
-  if (uv.y > -190.0 && uv.y < 225.0) {
+  // 主道。境内（v≈246〜294）まで通す。途中で切ると、石段の斜面が草地のままになる
+  if (uv.y > -190.0 && uv.y < 288.0) {
     considerPath(&best, abs(uv.x - lineB(0, uv.y)), 1.1, floorH + 0.55);
   }
   // 副道（横線 4 と -3 に沿う）
@@ -238,6 +238,7 @@ const KIND_HILL: u32 = 5u;
 const KIND_MOUNTAIN: u32 = 6u;
 const KIND_YARD: u32 = 7u;        // 集落の敷地（踏み固められた土）
 const KIND_PRECINCT: u32 = 8u;    // 神社の境内（玉砂利まじりの土）
+const KIND_STEPS: u32 = 9u;       // 石段（境内へ上がる斜面）
 
 struct Surface {
   height: f32,
@@ -309,8 +310,13 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
 
   // あぜ道は周囲より少し高い土手。敷地の上では敷地の高さを基準にする
   // （基準を谷底のままにすると、一段高い敷地に道が埋もれて消える）
-  let pathBase = mix(floorH, site.level, site.w);
-  if (t < 1.3) {
+  // その場の地面の高さを下回らせない。谷底基準のままだと、丘を上る参道で
+  // 道の高さが地面より低くなり、道が一切現れない（実測）
+  let pathBase = max(mix(floorH, site.level, site.w), h);
+  // 参道は盆地の外（t > 1.3）へ出るので、その範囲も通す。
+  // 条件を t < 1.3 だけにすると、境内へ上がる斜面が草地のままになる
+  let onApproach = abs(uv.x) < 22.0 && uv.y > 140.0 && uv.y < 292.0;
+  if (t < 1.3 || onApproach) {
     let path = nearestPath(uv, pathBase);
     let hw = path.halfWidth * widen;
     let pathH = h + (path.top - h) * bumpScale * (1.0 - smootherstep(hw * 0.6, hw + 0.7 * widen, path.dist));
@@ -320,6 +326,21 @@ fn terrainSurface(p: vec2f, minWl: f32) -> Surface {
       if (path.on) { s.kind = KIND_PATH; s.wet = 0.0; } else { s.kind = KIND_RIDGE; s.wet = 0.0; }
     }
     s.ridgeDist = min(s.ridgeDist, path.dist);
+  }
+
+  // 石段: 境内へ上がる斜面（v=240〜254）で、参道の高さを段状に量子化する。
+  // 別メッシュで載せると、道の土手や地形の S 字と競合して埋まる（実測で解決できなかった）。
+  // 地形そのものを段にすれば、原理的に埋まりも浮きもしない
+  if (uv.y > 239.0 && uv.y < 255.0) {
+    let dx = abs(uv.x - lineB(0, uv.y));
+    if (dx < 2.6) {
+      let stepH = 0.33;
+      let stepped = floor(h / stepH) * stepH + 0.04;
+      // 縁は滑らかに地形へ戻す。縁石を max で足すと、地形が低い側で壁のようにそびえる（実測）
+      let core = 1.0 - smootherstep(1.5, 2.3, dx);
+      h = mix(h, stepped, core);
+      if (dx < 2.1) { s.kind = KIND_STEPS; s.wet = 0.0; s.ridgeDist = 100.0; }
+    }
   }
 
   // 川の掘り込み
@@ -352,6 +373,7 @@ fn terrainAlbedo(p: vec2f, s: Surface) -> vec3f {
     case 6u: { return mix(vec3f(0.09, 0.14, 0.09), vec3f(0.16, 0.20, 0.13), n); }        // 山（林）
     case 7u: { return mix(vec3f(0.26, 0.21, 0.15), vec3f(0.37, 0.30, 0.21), n); }        // 集落の敷地（踏み固めた土）
     case 8u: { return mix(vec3f(0.33, 0.31, 0.27), vec3f(0.45, 0.42, 0.37), n); }        // 境内（玉砂利まじり）
+    case 9u: { return mix(vec3f(0.22, 0.215, 0.20), vec3f(0.34, 0.33, 0.31), n); }       // 石段
     default: { return mix(vec3f(0.20, 0.30, 0.09), vec3f(0.32, 0.38, 0.14), n); }        // 草地
   }
 }
